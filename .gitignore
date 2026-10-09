@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+# 원문·변환 결과는 이 공개 레포에 두지 않는다
+*.hwpx
+*.hwp
+tree.json
+build.log

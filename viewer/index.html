@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>형법 마인드맵</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=Nanum+Myeongjo:wght@700;800&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app" id="app">
+  <header class="topbar">
+    <button class="menu-btn" id="menuBtn" aria-label="목차 열기">☰</button>
+    <div class="brand"><h1 id="docName">형법 마인드맵</h1><span class="sub" id="docSub"></span></div>
+    <nav class="views" aria-label="보기">
+      <button data-view="map" aria-pressed="true">마인드맵</button>
+      <button data-view="overview" aria-pressed="false">전체 지도</button>
+      <button data-view="quiz" aria-pressed="false">암기 카드</button>
+      <button data-view="read" aria-pressed="false">원문</button>
+    </nav>
+    <div class="top-tools">
+      <button class="icon-btn wide" id="infoBtn" title="자료 정보 · 진도 백업">정보</button>
+      <button class="icon-btn" id="helpBtn" title="단축키 (?)" aria-label="단축키">?</button>
+      <button class="icon-btn" id="themeBtn" title="테마 바꾸기" aria-label="테마 바꾸기">◐</button>
+    </div>
+  </header>
+  <aside class="side" id="side">
+    <div class="search">
+      <input id="q" type="search" placeholder="검색 (초성 가능, /)" autocomplete="off" aria-label="본문 검색">
+      <div class="results" id="results" hidden></div>
+    </div>
+    <nav class="toc" id="toc" aria-label="목차"></nav>
+    <div class="side-foot" id="sideFoot"></div>
+  </aside>
+  <main class="main" id="main">
+    <div class="toolbar" id="toolbar">
+      <div class="crumb" id="crumb"></div>
+      <div class="seg" id="modeSeg" role="group" aria-label="학습 방식">
+        <button data-mode="study" aria-pressed="true" title="원문 그대로 (S)">보기</button>
+        <button data-mode="hide" aria-pressed="false" title="셀로판지처럼 가리고 하나씩 떠올리기 (H)">가리기</button>
+        <button data-mode="cloze" aria-pressed="false" title="밑줄·굵은 핵심어만 빈칸 (C)">빈칸</button>
+      </div>
+      <div class="seg" id="levelSeg" role="group" aria-label="펼치기 단계">
+        <span class="lab">펼치기</span>
+        <button data-level="1" aria-pressed="true" title="구성요건만 (1)">구성요건</button>
+        <button data-level="2" aria-pressed="false" title="+ 법리 (2)">+법리</button>
+        <button data-level="3" aria-pressed="false" title="판례까지 전부 (3)">전부</button>
+      </div>
+      <div class="zoom" id="zoomCtl">
+        <button id="zoomOut" aria-label="축소">−</button>
+        <span id="zoomVal">100%</span>
+        <button id="zoomIn" aria-label="확대">+</button>
+        <button id="zoomFit" class="wide" title="화면에 맞추기 (F)">맞춤</button>
+        <button id="layoutBtn" title="가로 맵 / 세로 목록 전환 (L)">목록</button>
+      </div>
+    </div>
+    <div class="mm-viewport" id="mmViewport" tabindex="0" aria-label="마인드맵">
+      <div class="mm-canvas" id="mmCanvas"></div>
+    </div>
+    <div class="overview" id="overview" hidden></div>
+    <div class="quiz" id="quiz" hidden></div>
+    <div class="reader" id="reader" hidden></div>
+  </main>
+</div>
+<script id="tree-data" type="application/json"></script>
+<script src="app.js"></script>
+</body>
+</html>

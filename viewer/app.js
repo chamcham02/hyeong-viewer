@@ -1,0 +1,1120 @@
+/* hyeong-viewer — 정리자료 트리(JSON)를 가로 마인드맵 · 암기 카드 · 원문 보기로 보여 준다.
+   데이터는 <script id="tree-data" type="application/json">에 인라인되거나, 파일로 불러온다.
+   원문 텍스트는 바꾸지 않는다: 화면의 .tx[data-pid] 안에는 원문 글자만 들어가고, 장식은 .deco로 구분한다. */
+(() => {
+  'use strict';
+
+  // ───────────── 작은 도구들 ─────────────
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
+  const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
+  const esc = s => String(s).replace(/[&<>"]/g, c => ESC[c]);
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const CIRC = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳';
+  const DAY = 86400000;
+  function hash(s) { // FNV-1a 32bit → base36
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return (h >>> 0).toString(36);
+  }
+  const normText = s => s.normalize('NFC').replace(/\s+/g, '');
+  const CHO = 'ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ';
+  const chosung = s => Array.from(s, ch => { const c = ch.charCodeAt(0) - 0xac00; return c >= 0 && c < 11172 ? CHO[Math.floor(c / 588)] : ch; }).join('');
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 저장 불가 환경 */ } },
+  };
+  function toast(msg) {
+    const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg; document.body.appendChild(t);
+    setTimeout(() => t.remove(), 1800);
+  }
+
+  // ───────────── 상태 ─────────────
+  let D = null, FM = [], FN = {};
+  const IDX = { byId: new Map(), parent: new Map(), crimes: [], chaps: [], cardsById: new Map(), search: null };
+  const S = {
+    view: 'map', mode: 'study', ci: 0, level: 1, z: 1, outline: false, sel: null,
+    open: new Set(), rev: new Set(), unclamp: new Set(),
+  };
+  let KEY = 'hv';
+  let P = { v: 1, cards: {} };
+
+  // ───────────── 시작 ─────────────
+  function boot() {
+    const raw = $('#tree-data').textContent.trim();
+    if (raw) { try { start(JSON.parse(raw)); return; } catch (e) { console.error(e); } }
+    showLoader();
+  }
+
+  function showLoader() {
+    const app = $('#app');
+    app.innerHTML = `<div class="loader"><div class="drop" id="drop">
+      <h1>정리자료 마인드맵</h1>
+      <p>변환한 <code>tree.json</code> 파일을 여기에 끌어다 놓거나 아래에서 고르세요.</p>
+      <p><input type="file" id="fileIn" accept=".json,application/json"></p>
+      <p style="font-size:13px">파일은 이 브라우저 안에서만 열리고 어디에도 올라가지 않습니다.<br>
+      변환: <code>python3 -I convert/hwpx2tree.py 자료.hwpx -o tree.json</code></p></div></div>`;
+    const drop = $('#drop');
+    const read = f => f.text().then(t => { location.hash = ''; document.body.innerHTML = ''; rebuildShell(); start(JSON.parse(t)); })
+      .catch(err => { drop.querySelector('p').textContent = 'JSON을 읽지 못했습니다: ' + err.message; });
+    $('#fileIn').addEventListener('change', e => e.target.files[0] && read(e.target.files[0]));
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+    drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && read(e.dataTransfer.files[0]); });
+  }
+  let SHELL = '';
+  function rebuildShell() { document.body.innerHTML = SHELL; }
+
+  function start(data) {
+    D = data; FM = D.fmts; FN = D.fns || {};
+    indexTree();
+    const name = D.meta.name || D.meta.title || '정리자료';
+    KEY = 'hv:' + hash(name + '|' + IDX.crimes.length);
+    P = store.get(KEY + ':progress', { v: 1, cards: {} });
+    const ui = store.get(KEY + ':ui', {});
+    Object.assign(S, { ci: clamp(ui.ci | 0, 0, IDX.crimes.length - 1), level: ui.level || 1, z: ui.z || 1, mode: ui.mode || 'study', view: ui.view || 'map' });
+    S.outline = ui.outline != null ? ui.outline : matchMedia('(max-width: 860px)').matches;
+    const theme = store.get('hv:theme', null);
+    if (theme) document.documentElement.dataset.theme = theme;
+    document.title = name + ' 마인드맵';
+    $('#docName').textContent = name;
+    $('#docSub').textContent = [D.meta.title, D.meta.subtitle].filter(Boolean).join(' · ');
+    $('#sideFoot').innerHTML = (D.meta.notice ? `<b>${esc(D.meta.notice)}</b><br>` : '') + '원문을 바꾸지 않고 구조만 나눈 학습용 보기입니다.';
+    buildCards();
+    renderTOC();
+    bindUI();
+    const hm = /^#c-(\d+)$/.exec(location.hash);
+    if (hm) S.ci = clamp(+hm[1], 0, IDX.crimes.length - 1);
+    setView(S.view, true);
+  }
+
+  // ───────────── 색인 ─────────────
+  function indexTree() {
+    let chap = null;
+    (function walk(n, p) {
+      IDX.byId.set(n.id, n);
+      if (p) IDX.parent.set(n.id, p.id);
+      if (n.k === 'chap') { chap = { node: n, crimes: [] }; IDX.chaps.push(chap); }
+      if (n.k === 'part') IDX.chaps.push({ part: n, crimes: [] });
+      if (n.k === 'crime') { const c = { node: n, idx: IDX.crimes.length, chap }; IDX.crimes.push(c); if (chap) chap.crimes.push(c); }
+      (n.c || []).forEach(ch => walk(ch, n));
+    })(D.root, null);
+  }
+  const T = n => { if (n._t == null) n._t = (n.s || []).map(s => s[0]).join(''); return n._t; };
+  const parentOf = n => IDX.byId.get(IDX.parent.get(n.id));
+  function crimeOf(n) { for (let x = n; x; x = parentOf(x)) if (x.k === 'crime') return x; return null; }
+  function crimeIdxOf(n) { const c = crimeOf(n); return c ? IDX.crimes.findIndex(x => x.node === c) : -1; }
+  function ancestors(n) { const out = []; for (let x = parentOf(n); x; x = parentOf(x)) out.push(x); return out; }
+  const kidsOf = n => (n.c || []).filter(x => x.k !== 'sp' && x.k !== 'sep');
+  const crimeName = n => n.name || T(n).replace(/^\s*\[|\]\s*$/g, '');
+
+  // ───────────── 원문 글자 렌더링 ─────────────
+  const FCLS = [];
+  function fmtClass(i) {
+    if (FCLS[i] != null) return FCLS[i];
+    const f = FM[i] || {}, c = [];
+    if (f.b) c.push('fb'); if (f.i) c.push('fi'); if (f.u) c.push('fu'); if (f.k) c.push('fk');
+    if (f.c) c.push(f.c === '#0000FF' || f.c === '#0432FF' ? 'fblue' : f.c === '#C75252' ? 'fred' : 'fgray');
+    if (f.h) c.push('fshade'); if (f.g) c.push('fbg'); if (f.x) c.push('fx'); if (f.m) c.push('fmark');
+    return (FCLS[i] = c.join(' '));
+  }
+  const isBlue = i => { const f = FM[i] || {}; return f.c === '#0000FF' || f.c === '#0432FF'; };
+
+  /* segs → HTML. marks: [{s,e,cls,key}] (겹치지 않게 정리됨). 각주 앵커는 .deco sup */
+  function segsHTML(segs, marks) {
+    marks = normMarks(marks || []);
+    let out = '', off = 0, mi = 0, open = null;
+    const closeMark = () => { if (open) { out += '</span>'; open = null; } };
+    for (const sg of segs || []) {
+      if (sg.length === 3) { out += `<sup class="fn deco" data-fn="${sg[2]}" role="button" tabindex="0" aria-label="각주 ${sg[2]}">${sg[2]}</sup>`; continue; }
+      const text = sg[0], cls = fmtClass(sg[1]);
+      let i = 0;
+      while (i < text.length) {
+        const pos = off + i;
+        while (mi < marks.length && marks[mi].e <= pos) mi++;
+        const m = mi < marks.length && marks[mi].s <= pos ? marks[mi] : null;
+        const end = m ? Math.min(m.e - off, text.length) : (mi < marks.length ? Math.min(marks[mi].s - off, text.length) : text.length);
+        if (m !== open) { closeMark(); if (m) { out += `<span class="mk ${m.cls}"${m.key ? ` data-k="${esc(m.key)}"` : ''}>`; open = m; } }
+        const piece = esc(text.slice(i, end));
+        out += cls ? `<span class="${cls}">${piece}</span>` : piece;
+        i = end;
+      }
+      off += text.length;
+    }
+    closeMark();
+    return out;
+  }
+  function normMarks(ms) {
+    ms = ms.filter(m => m.e > m.s).sort((a, b) => a.s - b.s || b.e - a.e);
+    const out = [];
+    for (const m of ms) { if (!out.length || m.s >= out[out.length - 1].e) out.push(m); }
+    return out;
+  }
+  const txSpan = (p, marks, extra = '') => `<span class="tx${extra}" data-pid="${esc(p.pid)}">${segsHTML(p.s, marks)}</span>`;
+
+  // 핵심어(밑줄·굵게, 파란 메모 제외) 구간
+  function keyRanges(n) {
+    if (n._kr) return n._kr;
+    const flags = [];
+    for (const sg of n.s || []) {
+      if (sg.length === 3) continue;
+      const f = FM[sg[1]] || {}, key = (f.u || f.b) && !isBlue(sg[1]);
+      for (const ch of sg[0]) flags.push(/[\s·,]/.test(ch) ? (key ? 2 : 0) : key ? 1 : 0);
+    }
+    const out = []; let s = -1, lastKey = -1;
+    for (let i = 0; i <= flags.length; i++) {
+      const v = i < flags.length ? flags[i] : 0;
+      if (v === 1) { if (s < 0) s = i; lastKey = i; } else if (v === 0 && s >= 0) { out.push([s, lastKey + 1]); s = -1; }
+    }
+    return (n._kr = out.filter(([a, b]) => b - a >= 1));
+  }
+  const verdictMarks = (n, cls, keyp) => (n.ox ? n.ox.v : []).map((v, i) => {
+    const ch = T(n)[v];
+    return { s: v, e: v + 1, cls: cls || ('v-' + ch), key: keyp ? `${n.id}:v${i}` : null };
+  });
+
+  // ───────────── 암기 카드(SRS) ─────────────
+  const BOX_DAYS = [0, 1, 3, 7, 14, 30];
+  function buildCards() {
+    for (const c of IDX.crimes) {
+      c.cards = [];
+      const n = c.node, nm = crimeName(n);
+      const heads = kidsOf(n).filter(x => x.k === 'el');
+      if (heads.length) c.cards.push(mkCard('el', c, n, 'el:' + hash(nm)));
+      (function walk(x, ctx) {
+        if (x.k === 'stat') {
+          for (const cell of x.cells) for (const p of cell.ps) if (p.art && p.art.els) c.cards.push(mkCard('art', c, x, 'art:' + hash(nm + '|' + T(p)), { para: p }));
+        }
+        if (x.k === 'p') {
+          const t = T(x), tags = x.tags || [];
+          if (x.ox) c.cards.push(mkCard('ox', c, x, 'ox:' + hash(nm + '|' + normText(t))));
+          if (tags.includes('def')) c.cards.push(mkCard('def', c, x, 'def:' + hash(nm + '|' + normText(t))));
+          if (tags.includes('yak')) c.cards.push(mkCard('yak', c, x, 'yak:' + hash(nm + '|' + normText(t))));
+          else if (tags.includes('hong')) c.cards.push(mkCard('hong', c, x, 'hong:' + hash(nm + '|' + normText(t))));
+        }
+        (x.c || []).forEach(ch => walk(ch));
+      })(n);
+    }
+  }
+  function mkCard(type, crime, node, id, extra) {
+    const card = Object.assign({ type, crime, node, id }, extra || {});
+    IDX.cardsById.set(id, card);
+    if (type === 'ox' || type === 'def') node._card = id;
+    return card;
+  }
+  const cardState = id => P.cards[id];
+  function grade(id, g) { // g: 0 몰랐음, 1 헷갈림, 2 알았음
+    const now = Date.now(), st = P.cards[id] || { b: 0, r: 0, w: 0 };
+    if (g === 0) { st.b = 0; st.d = now + 10 * 60000; st.w++; st.l = 0; }
+    else if (g === 1) { st.b = Math.max(1, Math.min(st.b, 2)); st.d = now + DAY; st.l = 1; }
+    else { st.b = Math.min(st.b + 1, BOX_DAYS.length - 1); st.d = now + BOX_DAYS[st.b] * DAY; st.r++; st.l = 2; }
+    st.t = now;
+    P.cards[id] = st;
+    store.set(KEY + ':progress', P);
+    updateTOCProgress();
+  }
+  function crimeProgress(c) {
+    const now = Date.now();
+    let known = 0, due = 0;
+    for (const k of c.cards) { const st = P.cards[k.id]; if (st && st.b >= 2) known++; if (!st || st.d <= now) due++; }
+    return { known, due, total: c.cards.length };
+  }
+
+  // ───────────── 목차 ─────────────
+  function renderTOC() {
+    const toc = $('#toc');
+    let h = '';
+    for (const ch of IDX.chaps) {
+      if (ch.part) { h += `<div class="part">${esc(ch.part.title || '')}</div>`; continue; }
+      const title = ch.node.title || '';
+      const m = /^\s*(제\s*\d+\s*장)\s*(.*)$/.exec(title);
+      h += `<div class="chap${ch.node.del ? ' del' : ''}">${m ? `<span class="no">${esc(m[1].replace(/\s+/g, ''))}</span><span>${esc(m[2])}</span>` : `<span>${esc(title)}</span>`}</div>`;
+      for (const c of ch.crimes) {
+        h += `<button class="crime" data-ci="${c.idx}"><span>${esc(crimeName(c.node))}</span><span class="meta" data-meta="${c.idx}"></span><span class="bar"><i data-bar="${c.idx}"></i></span></button>`;
+      }
+    }
+    toc.innerHTML = h;
+    updateTOCProgress();
+  }
+  function updateTOCProgress() {
+    for (const c of IDX.crimes) {
+      const p = crimeProgress(c), bar = $(`[data-bar="${c.idx}"]`), meta = $(`[data-meta="${c.idx}"]`);
+      if (bar) bar.style.width = p.total ? (100 * p.known / p.total).toFixed(1) + '%' : '0';
+      if (meta) meta.textContent = p.total ? `${p.known}/${p.total}` : '';
+    }
+  }
+  function markTOC() {
+    $$('#toc .crime').forEach(b => b.setAttribute('aria-current', String(+b.dataset.ci === S.ci)));
+    const cur = $(`#toc .crime[data-ci="${S.ci}"]`);
+    if (cur) cur.scrollIntoView({ block: 'nearest' });
+  }
+
+  // ───────────── 보기 전환 ─────────────
+  function saveUI() { store.set(KEY + ':ui', { ci: S.ci, level: S.level, z: S.z, mode: S.mode, view: S.view, outline: S.outline }); }
+  function setView(v, first) {
+    S.view = v;
+    $$('.views button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.view === v)));
+    $('#mmViewport').hidden = v !== 'map';
+    $('#overview').hidden = v !== 'overview';
+    $('#quiz').hidden = v !== 'quiz';
+    $('#reader').hidden = v !== 'read';
+    $('#levelSeg').hidden = $('#zoomCtl').hidden = v !== 'map';
+    $('#modeSeg').hidden = v === 'quiz' || v === 'read';
+    if (v === 'map') openCrime(S.ci, { keepView: true, first });
+    else if (v === 'overview') renderOverview();
+    else if (v === 'quiz') renderQuiz(true);
+    else if (v === 'read') renderReader();
+    updateCrumb();
+    saveUI();
+  }
+  function updateCrumb() {
+    const c = IDX.crimes[S.ci];
+    if (!c) return;
+    const chapT = c.chap ? c.chap.node.title || '' : '';
+    if (S.view === 'overview') { $('#crumb').innerHTML = `전체 지도<small>장 → 죄 → 구성요건. 이름을 누르면 마인드맵으로 갑니다</small>`; return; }
+    if (S.view === 'quiz') { $('#crumb').innerHTML = `암기 카드<small>${esc(chapT)} · ${esc(crimeName(c.node))}</small>`; return; }
+    $('#crumb').innerHTML = `${esc(crimeName(c.node))}<small>${esc(chapT)}${c.node.syn ? ' · 제목 없는 조문 묶음' : ''}</small>`;
+  }
+
+  function openCrime(ci, opt = {}) {
+    S.ci = clamp(ci, 0, IDX.crimes.length - 1);
+    if (!opt.keepView && S.view !== 'map' && S.view !== 'read' && S.view !== 'quiz') S.view = 'map';
+    markTOC();
+    try { history.replaceState(null, '', '#c-' + S.ci); } catch (e) { /* file:// 등 */ }
+    if (S.view === 'map') {
+      if (!opt.keepOpen) { S.rev.clear(); S.unclamp.clear(); presetOpen(S.level); }
+      renderMap();
+      if (!opt.noFit && !opt.target) requestAnimationFrame(() => { const vp = $('#mmViewport'); vp.scrollLeft = 0; vp.scrollTop = 0; });
+    } else if (S.view === 'read') renderReader();
+    else if (S.view === 'quiz') renderQuiz(true);
+    updateCrumb();
+    saveUI();
+    $('#side').classList.remove('open');
+  }
+
+  // ───────────── 마인드맵 ─────────────
+  function presetOpen(level) {
+    S.open.clear();
+    const n = IDX.crimes[S.ci].node;
+    (function walk(x, d) {
+      for (const ch of kidsOf(x)) {
+        if (kidsOf(ch).length && (level >= 3 || (level >= 2 && ch.k === 'el'))) S.open.add(ch.id);
+        walk(ch, d + 1);
+      }
+    })(n, 0);
+  }
+
+  const HINT = n => n.k === 'el' ? (n.box ? '박스 요건' : '구성요건') : n.k === 'tbl' ? '비교표' : n.k === 'case' ? '사례 답안' :
+    ({ g: '법리', m: '중간분류', d: '세부', n: n.ox ? '판례 O/X' : '참조', x: '참조' })[n.lv] || '내용';
+
+  function cardMarks(n, keyBase) {
+    const t = T(n);
+    if (S.mode === 'study') return n.ox ? verdictMarks(n) : [];
+    if (S.mode === 'hide') {
+      if (n.ox && n.ox.q) { const k = n.id + ':a'; return S.rev.has(k) ? verdictMarks(n) : [{ s: n.ox.a[0], e: t.length, cls: 'hide', key: k }]; }
+      if (n.ox) return n.ox.v.map((v, i) => { const k = `${n.id}:v${i}`; return { s: v, e: v + 1, cls: S.rev.has(k) ? 'v-' + t[v] : 'hide', key: k }; });
+      return [];
+    }
+    // cloze
+    if (n.k === 'el') return [];
+    const ms = keyRanges(n).map(([a, b], i) => { const k = `${n.id}:k${i}`; return { s: a, e: b, cls: S.rev.has(k) ? 'shown' : 'blank', key: k }; });
+    return ms.concat((n.ox ? n.ox.v : []).map((v, i) => { const k = `${n.id}:v${i}`; return { s: v, e: v + 1, cls: S.rev.has(k) ? 'v-' + t[v] : 'blank', key: k }; }));
+  }
+  function conceals(n) {
+    if (S.mode !== 'hide') return false;
+    if (n.k === 'p' && n.ox) return false; // O/X는 질문을 보여 주고 답만 가린다
+    return !S.rev.has(n.id);
+  }
+
+  function badgesHTML(n) {
+    const tags = n.tags || [];
+    const lab = { hong: '채점', yak: '약술형', def: '정의', star: '★', new: '최신', pan: '판례', hak: '학설' };
+    let h = tags.filter(t => lab[t] && t !== 'pan' && t !== 'hak').map(t => `<span class="badge ${t}">${lab[t]}</span>`).join('');
+    if (n.mn) h += `<span class="badge mn" title="두문자">${esc(n.mn)}</span>`;
+    return h ? `<span class="badges deco">${h}</span>` : '';
+  }
+  function linkChips(n) {
+    if (!n.ln) return '';
+    const crime = crimeOf(n), arts = crime.arts || [];
+    const short = a => a.replace(/^\(.*?\)/, '').replace(/죄$/, '').slice(0, 14);
+    const items = n.ln.slice(0, 4).map(([a, e]) => `<span class="chip" data-art="${a}" data-el="${e}">${esc(short(arts[a] || ''))} ${CIRC[e] || ''}</span>`);
+    if (n.ln.length > 4) items.push(`<span class="chip">+${n.ln.length - 4}</span>`);
+    return `<span class="chips deco">${items.join('')}</span>`;
+  }
+
+  function tableHTML(t) {
+    const rows = [];
+    for (const c of t.cells) (rows[c.r] = rows[c.r] || []).push(c);
+    return `<div class="htable-wrap"><table class="htable"><tbody>${rows.map(r => `<tr>${r.map(c => `<td${c.rs > 1 ? ` rowspan="${c.rs}"` : ''}${c.cs > 1 ? ` colspan="${c.cs}"` : ''}>${cellParas(c.ps)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  }
+  function cellParas(ps) {
+    return ps.map(p => p.tbl ? tableHTML(p.tbl) : `<div>${p.b ? `<span class="bul deco">${esc(p.b)}</span>` : ''}${p.num ? `<span class="num deco">${esc(p.num)}</span>` : ''}${txSpan(p)}</div>`).join('');
+  }
+  function caseHTML(t) {
+    return `<div class="casebox">${t.cells.map(c => `<div class="cell">${c.ps.map(p => p.tbl ? tableHTML(p.tbl) :
+      `<p style="padding-left:${((p.ind || 0) / 500).toFixed(2)}em">${p.b ? `<span class="bul deco">${esc(p.b)}</span>` : ''}${p.num ? `<span class="num deco">${esc(p.num)}</span>` : ''}${txSpan(p)}</p>`).join('')}</div>`).join('')}</div>`;
+  }
+
+  function cardHTML(n, nk) {
+    const cls = ['card', 'k-' + n.k];
+    if (n.lv) cls.push('lv-' + n.lv);
+    if (n.box) cls.push('box');
+    if (S.sel === n.id) cls.push('sel');
+    const conc = conceals(n);
+    if (conc) cls.push('concealed');
+    const st = n._card && cardState(n._card);
+    if (st && st.l === 2) cls.push('g-ok'); else if (st && st.l === 0) cls.push('g-ng');
+    let body;
+    if (n.k === 'tbl') body = `<span class="tx-wrap">${tableHTML(n)}</span>`;
+    else if (n.k === 'case') body = caseHTML(n);
+    else {
+      const long = T(n).length > 170 && !S.unclamp.has(n.id) && !conc;
+      if (long) cls.push('clamp');
+      const kind = n.k === 'el' ? `<span class="kind deco">${n.box ? '박스 요건' : n.issue ? '쟁점' : '구성요건'}</span>` : '';
+      const bul = n.k === 'p' && n.b ? `<span class="bul deco">${esc(n.b)}</span>` : '';
+      const num = n.num ? `<span class="num deco">${esc(n.num)}</span>` : '';
+      body = kind + bul + num + txSpan(n, cardMarks(n)) + badgesHTML(n) + (n.k === 'el' ? linkChips(n) : '') +
+        (long ? `<button class="more deco">더보기</button>` : (T(n).length > 170 && S.unclamp.has(n.id) ? `<button class="more deco">접기</button>` : ''));
+      if (S.mode === 'hide' && n._card && (!conc) && revealedAll(n)) {
+        body += `<span class="grade deco"><button class="ok" data-g="2" data-card="${n._card}">✓ 알았음</button><button class="ng" data-g="0" data-card="${n._card}">✗ 몰랐음</button></span>`;
+      }
+    }
+    if ((n.k === 'tbl' || n.k === 'case') && conc) body = `<span class="tx">${'표 내용'.padEnd(18, ' ')}</span>`;
+    const tog = nk ? `<button class="kid-toggle deco" data-tog="${n.id}" aria-label="하위 ${nk}개 ${S.open.has(n.id) ? '접기' : '펼치기'}">${nk}</button>` : '';
+    return `<div class="${cls.join(' ')}" data-id="${n.id}" data-hint="${conc ? esc(HINT(n)) + ' · 눌러서 보기' : ''}">${body}${tog}</div>`;
+  }
+  function revealedAll(n) {
+    if (!n.ox) return S.rev.has(n.id);
+    if (n.ox.q) return S.rev.has(n.id + ':a');
+    return n.ox.v.every((_, i) => S.rev.has(`${n.id}:v${i}`));
+  }
+
+  function nodeHTML(n, br) {
+    const kids = kidsOf(n);
+    const open = S.open.has(n.id);
+    let h = `<div class="mm-node br-${br}${kids.length && !open ? ' closed' : ''}" data-node="${n.id}">${cardHTML(n, kids.length)}`;
+    if (kids.length) h += `<div class="mm-kids">${open ? kids.map(k => nodeHTML(k, br)).join('') : ''}</div>`;
+    return h + '</div>';
+  }
+
+  function rootCardHTML(c) {
+    const n = c.node;
+    const t = T(n);
+    const brk = [];
+    const m1 = /^\s*\[/.exec(t), m2 = /\]\s*$/.exec(t);
+    if (m1) brk.push({ s: m1.index, e: m1.index + m1[0].length, cls: 'brk' });
+    if (m2) brk.push({ s: m2.index, e: t.length, cls: 'brk' });
+    let h = `<div class="card k-root${S.sel === n.id ? ' sel' : ''}" data-id="${n.id}"><div class="crime-name">${n.pid ? txSpan(n, brk) : esc(n.name)}</div>`;
+    if (n.syn) h += `<div class="crime-sub">제목 없이 장 아래 조문으로 시작하는 부분</div>`;
+    const stats = (n.c || []).filter(x => x.k === 'stat');
+    if (stats.length) {
+      h += '<div class="arts">';
+      let ai = 0;
+      for (const st of stats) {
+        for (const cell of st.cells) for (const p of cell.ps) {
+          if (p.tbl) { h += tableHTML(p.tbl); continue; }
+          const marks = [];
+          if (p.art) {
+            marks.push({ s: p.art.name[0], e: p.art.name[1], cls: 'art-name' });
+            marks.push({ s: p.art.ref[0], e: p.art.ref[1], cls: 'art-ref' });
+            (p.art.els || []).forEach(([a, b], ei) => {
+              const k = `${p.pid}:e${ei}`;
+              const hidden = (S.mode === 'hide' || S.mode === 'cloze') && !S.rev.has(k);
+              marks.push({ s: a, e: b, cls: (hidden ? (S.mode === 'hide' ? 'hide' : 'blank') : 'art-el') + ` ae-${ai}-${ei}`, key: k });
+            });
+            ai++;
+          }
+          h += `<p class="art">${txSpan(p, marks)}</p>`;
+        }
+        const notes = kidsOf(st);
+        if (notes.length) h += `<ul class="stat-notes">${notes.map(noteHTML).join('')}</ul>`;
+      }
+      h += '</div>';
+    }
+    return h + '</div>';
+  }
+  function noteHTML(n) {
+    const conc = conceals(n);
+    const inner = n.k === 'tbl' ? tableHTML(n) : n.k === 'case' ? caseHTML(n) : txSpan(n, cardMarks(n));
+    const kids = kidsOf(n);
+    return `<li class="${conc ? 'concealed' : ''}" data-id="${n.id}">${inner}${kids.length ? `<ul>${kids.map(noteHTML).join('')}</ul>` : ''}</li>`;
+  }
+
+  function renderMap() {
+    const c = IDX.crimes[S.ci], n = c.node;
+    const canvas = $('#mmCanvas');
+    document.body.classList.toggle('outline', S.outline);
+    $('#mmViewport').classList.toggle('outline', S.outline);
+    $('#layoutBtn').textContent = S.outline ? '맵' : '목록';
+    canvas.style.setProperty('--z', S.z);
+    $('#zoomVal').textContent = Math.round(S.z * 100) + '%';
+    const branches = kidsOf(n).filter(x => x.k !== 'stat');
+    let h = `<svg class="mm-wires" aria-hidden="true"></svg><div class="mm-node mm-root" data-node="${n.id}">${rootCardHTML(c)}`;
+    if (branches.length) h += `<div class="mm-kids">${branches.map((b, i) => nodeHTML(b, (i % 8) + 1)).join('')}</div>`;
+    // 구분선·빈 문단은 학습 내용이 아니므로 숨긴 채로만 둔다(원문 글자는 그대로 보존)
+    const quiet = [];
+    (function walk(x) { for (const ch of x.c || []) { if ((ch.k === 'sp' || ch.k === 'sep') && ch.pid) quiet.push(`<span class="tx" data-pid="${esc(ch.pid)}">${segsHTML(ch.s)}</span>`); walk(ch); } })(n);
+    canvas.innerHTML = h + '</div>' + (quiet.length ? `<div class="mm-quiet" hidden>${quiet.join('')}</div>` : '');
+    $$('.mm-viewport').forEach(v => v.classList.toggle('outline', S.outline));
+    scheduleWires();
+    $$('#modeSeg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === S.mode)));
+    $$('#levelSeg button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.level === S.level)));
+  }
+
+  // 한 노드만 다시 그린다(펼치기·공개 시 전체 재렌더 대신)
+  function rerenderNode(id) {
+    const wrap = $(`.mm-node[data-node="${id}"]`);
+    const n = IDX.byId.get(id);
+    if (!wrap || !n) { renderMap(); return; }
+    if (wrap.classList.contains('mm-root')) { renderMap(); return; }
+    const br = +(/br-(\d+)/.exec(wrap.className) || [0, 1])[1];
+    const tmp = document.createElement('div');
+    tmp.innerHTML = nodeHTML(n, br);
+    wrap.replaceWith(tmp.firstElementChild);
+    scheduleWires();
+  }
+  function rerenderCard(id) {
+    const n = IDX.byId.get(id);
+    const card = $(`#mmCanvas .card[data-id="${id}"]`);
+    if (!n || !card) return;
+    if (card.classList.contains('k-root')) { renderMap(); return; }
+    const tmp = document.createElement('div');
+    tmp.innerHTML = cardHTML(n, kidsOf(n).length);
+    card.replaceWith(tmp.firstElementChild);
+    scheduleWires();
+  }
+
+  let wireRAF = 0;
+  function scheduleWires() { cancelAnimationFrame(wireRAF); wireRAF = requestAnimationFrame(drawWires); }
+  function drawWires() {
+    const canvas = $('#mmCanvas'), svg = canvas && canvas.querySelector('.mm-wires');
+    if (!svg || S.view !== 'map') return;
+    if (S.outline) { svg.innerHTML = ''; return; }
+    const W = canvas.scrollWidth, H = canvas.scrollHeight;
+    svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    const rel = el => { let x = 0, y = 0; for (let e = el; e && e !== canvas; e = e.offsetParent) { x += e.offsetLeft; y += e.offsetTop; } return { x, y }; };
+    let d = '';
+    const byBr = {};
+    for (const wrap of canvas.querySelectorAll('.mm-node:not(.closed)')) {
+      const card = wrap.firstElementChild, kids = wrap.lastElementChild;
+      if (!kids || !kids.classList.contains('mm-kids') || !kids.firstElementChild) continue;
+      const p = rel(card), tog = card.querySelector(':scope > .kid-toggle');
+      const x1 = p.x + (tog ? tog.offsetLeft + tog.offsetWidth : card.offsetWidth), y1 = p.y + card.offsetHeight / 2;
+      for (const ch of kids.children) {
+        const cc = ch.firstElementChild, q = rel(cc);
+        const x2 = q.x, y2 = q.y + cc.offsetHeight / 2, mx = x1 + Math.max(12, (x2 - x1) * 0.55);
+        const br = (/br-(\d+)/.exec(ch.className) || [0, 1])[1];
+        (byBr[br] = byBr[br] || []).push(`M${x1.toFixed(1)},${y1.toFixed(1)}C${mx.toFixed(1)},${y1.toFixed(1)} ${(x2 - (x2 - x1) * 0.35).toFixed(1)},${y2.toFixed(1)} ${x2.toFixed(1)},${y2.toFixed(1)}`);
+      }
+    }
+    for (const br in byBr) d += `<path d="${byBr[br].join('')}" style="stroke:var(--b${br})"/>`;
+    svg.innerHTML = d;
+  }
+
+  function toggleNode(id, force) {
+    const n = IDX.byId.get(id);
+    if (!n || !kidsOf(n).length) return;
+    const open = force != null ? force : !S.open.has(id);
+    if (open) S.open.add(id); else S.open.delete(id);
+    rerenderNode(id);
+  }
+  function select(id, scroll) {
+    const prev = S.sel && $(`#mmCanvas .card[data-id="${S.sel}"]`);
+    if (prev) prev.classList.remove('sel');
+    S.sel = id;
+    const card = $(`#mmCanvas .card[data-id="${id}"]`);
+    if (card) { card.classList.add('sel'); if (scroll) card.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' }); }
+  }
+  function revealNode(n) {
+    if (n.ox && n.ox.q) S.rev.add(n.id + ':a');
+    else if (n.ox) n.ox.v.forEach((_, i) => S.rev.add(`${n.id}:v${i}`));
+    S.rev.add(n.id);
+  }
+
+  function setZoom(z, anchor) {
+    const vp = $('#mmViewport');
+    const old = S.z;
+    S.z = clamp(Math.round(z * 100) / 100, 0.4, 1.8);
+    const ax = anchor ? anchor.x : vp.clientWidth / 2, ay = anchor ? anchor.y : vp.clientHeight / 2;
+    const cx = (vp.scrollLeft + ax) / old, cy = (vp.scrollTop + ay) / old;
+    $('#mmCanvas').style.setProperty('--z', S.z);
+    $('#zoomVal').textContent = Math.round(S.z * 100) + '%';
+    vp.scrollLeft = cx * S.z - ax; vp.scrollTop = cy * S.z - ay;
+    scheduleWires();
+    saveUI();
+  }
+  function fit() {
+    const vp = $('#mmViewport'), canvas = $('#mmCanvas');
+    const w = canvas.scrollWidth / S.z, h = canvas.scrollHeight / S.z;
+    setZoom(clamp(Math.min(vp.clientWidth / w, vp.clientHeight / h) * 0.98, 0.4, 1.2));
+    vp.scrollLeft = 0; vp.scrollTop = 0;
+  }
+
+  // 검색·덱에서 특정 노드로 이동
+  function goToNode(n) {
+    const ci = crimeIdxOf(n);
+    if (ci < 0) return;
+    let target = n;
+    // 조문 박스 안 문단·표 셀 문단이면 그 노드 자체로
+    if (S.view !== 'map') setView('map');
+    if (ci !== S.ci) openCrime(ci, { keepView: true, target: true });
+    for (const a of ancestors(target)) if (a.k !== 'crime') S.open.add(a.id);
+    if (S.mode === 'hide') revealNode(target);
+    renderMap();
+    requestAnimationFrame(() => {
+      let card = $(`#mmCanvas .card[data-id="${target.id}"]`) || $(`#mmCanvas [data-id="${target.id}"]`);
+      if (!card) for (const a of ancestors(target)) { card = $(`#mmCanvas .card[data-id="${a.id}"]`); if (card) break; }
+      if (card) {
+        const c = card.closest('.card') || card;
+        c.scrollIntoView({ block: 'center', inline: 'center' });
+        c.classList.add('flash');
+        if (c.dataset.id) select(c.dataset.id);
+      }
+    });
+  }
+
+  // ───────────── 원문 보기 ─────────────
+  function renderReader() {
+    const c = IDX.crimes[S.ci], n = c.node;
+    const fnUsed = [];
+    const collectFn = segs => (segs || []).forEach(s => { if (s.length === 3) fnUsed.push(s[2]); });
+    let h = `<article><h2>${n.pid ? txSpan(n) : esc(n.name)}</h2><p class="rsub">${esc(c.chap ? c.chap.node.title || '' : '')}</p>`;
+    collectFn(n.s);
+    const P = x => {
+      collectFn(x.s);
+      const lv = x.lv || 'g';
+      return `<div class="rp lv-${lv}${x.cont ? ' cont' : ''}">${x.b ? `<span class="bul deco">${esc(x.b)}</span>` : ''}${x.num ? `<span class="num deco">${esc(x.num)}</span>` : ''}<span>${txSpan(x, x.ox ? verdictMarks(x) : [])}${badgesHTML(x)}</span></div>`;
+    };
+    const tblFn = t => t.cells.forEach(cell => cell.ps.forEach(p => p.tbl ? tblFn(p.tbl) : collectFn(p.s)));
+    function walk(list) {
+      let out = '', box = null;
+      for (const x of list) {
+        const bid = x.k === 'el' && x.box ? x.box : null;
+        if (box && bid !== box) { out += '</div>'; box = null; }
+        if (bid && !box) { out += '<div class="rbox">'; box = bid; }
+        if (x.k === 'stat') {
+          tblFn(x);
+          out += `<div class="rstat">${x.cells.map(cell => cell.ps.map(p => p.tbl ? tableHTML(p.tbl) : `<p>${txSpan(p, p.art ? [{ s: p.art.name[0], e: p.art.name[1], cls: 'art-name' }] : [])}</p>`).join('')).join('')}</div>`;
+          out += walk(x.c || []);
+        } else if (x.k === 'el') { collectFn(x.s); out += `<h3>${txSpan(x)}</h3>` + walk(x.c || []); }
+        else if (x.k === 'p') out += P(x) + walk(x.c || []);
+        else if (x.k === 'tbl') { tblFn(x); out += tableHTML(x); }
+        else if (x.k === 'case') { tblFn(x); out += caseHTML(x); }
+        else if (x.k === 'sep') { collectFn(x.s); out += `<hr><span class="tx" data-pid="${esc(x.pid)}" hidden>${segsHTML(x.s)}</span>`; }
+        else if (x.k === 'sp') out += `<span class="tx" data-pid="${esc(x.pid)}" hidden>${segsHTML(x.s)}</span>`;
+        else out += walk(x.c || []);
+      }
+      if (box) out += '</div>';
+      return out;
+    }
+    h += walk(n.c || []);
+    if (fnUsed.length) {
+      h += `<div class="fnlist">${fnUsed.map(k => `<div><span class="fnno deco">${k})</span> ${(FN[String(k)] || []).map(p => p.tbl ? tableHTML(p.tbl) : `<p>${txSpan(p)}</p>`).join('')}</div>`).join('')}</div>`;
+    }
+    const prev = IDX.crimes[S.ci - 1], next = IDX.crimes[S.ci + 1];
+    h += `<div class="nav">${prev ? `<button data-go="${S.ci - 1}">← ${esc(crimeName(prev.node))}</button>` : '<span></span>'}${next ? `<button data-go="${S.ci + 1}">${esc(crimeName(next.node))} →</button>` : ''}</div></article>`;
+    const r = $('#reader');
+    r.innerHTML = h;
+    r.scrollTop = 0;
+  }
+
+  // ───────────── 전체 지도 ─────────────
+  function renderOverview() {
+    let h = '<div class="ov-grid">';
+    for (const ch of IDX.chaps) {
+      if (ch.part || !ch.crimes.length) continue;
+      h += `<section class="ov-chap"><h3>${esc(ch.node.title || '')}</h3>`;
+      for (const c of ch.crimes) {
+        h += `<div class="ov-crime"><button data-ci="${c.idx}">${esc(crimeName(c.node))}</button><ol>`;
+        for (const x of kidsOf(c.node)) {
+          if (x.k !== 'el') continue;
+          const subs = kidsOf(x).filter(y => y.k === 'el');
+          h += ovItem(x, c.idx, false, subs.length ? `<ul>${subs.map(y => ovItem(y, c.idx, true, '')).join('')}</ul>` : '');
+        }
+        h += '</ol></div>';
+      }
+      h += '</section>';
+    }
+    $('#overview').innerHTML = h + '</div>';
+  }
+  function ovItem(x, ci, box, inner) {
+    const conc = S.mode === 'hide' && !S.rev.has('ov:' + x.id);
+    return `<li class="${box ? 'box ' : ''}${conc ? 'concealed' : ''}" data-ov="${x.id}" data-ci="${ci}">${txSpan(x)}${inner}</li>`;
+  }
+
+  // ───────────── 암기 카드 ─────────────
+  const DECKS = [['el', '구성요건 목록'], ['art', '조문 요건'], ['ox', '판례 O/X'], ['def', '정의'], ['yak', '약술형'], ['hong', '채점 노트'], ['all', '전부 섞기']];
+  const Q = { deck: 'el', scope: 'crime', order: 'due', wrong: false, queue: [], i: 0, step: 0, answers: [], revealed: false, scopeCi: -1 };
+  function buildQueue() {
+    const c = IDX.crimes[S.ci];
+    let pool = [];
+    if (Q.scope === 'crime') pool = c.cards;
+    else if (Q.scope === 'chap') pool = (c.chap ? c.chap.crimes : [c]).flatMap(x => x.cards);
+    else pool = IDX.crimes.flatMap(x => x.cards);
+    pool = pool.filter(k => Q.deck === 'all' || k.type === Q.deck);
+    const now = Date.now();
+    if (Q.wrong) pool = pool.filter(k => { const st = P.cards[k.id]; return st && st.l === 0; });
+    if (Q.order === 'due') {
+      const due = pool.filter(k => { const st = P.cards[k.id]; return !st || st.d <= now; });
+      pool = due.length ? due : pool;
+      pool = pool.slice().sort((a, b) => ((P.cards[a.id] || {}).b || 0) - ((P.cards[b.id] || {}).b || 0));
+    } else if (Q.order === 'rand') {
+      pool = pool.slice();
+      for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+    }
+    Q.queue = pool; Q.i = 0; resetCard();
+  }
+  function resetCard() { Q.step = 0; Q.answers = []; Q.revealed = false; }
+  function renderQuiz(rebuild) {
+    if (rebuild || Q.scopeCi !== S.ci) { Q.scopeCi = S.ci; buildQueue(); }
+    const counts = {};
+    const c = IDX.crimes[S.ci];
+    const scopePool = Q.scope === 'crime' ? c.cards : Q.scope === 'chap' ? (c.chap ? c.chap.crimes : [c]).flatMap(x => x.cards) : IDX.crimes.flatMap(x => x.cards);
+    for (const k of scopePool) counts[k.type] = (counts[k.type] || 0) + 1;
+    counts.all = scopePool.length;
+    const known = scopePool.filter(k => (P.cards[k.id] || {}).b >= 2).length;
+    let h = `<div class="qwrap"><div class="qctl">
+      <select id="qDeck" aria-label="카드 종류">${DECKS.map(([k, l]) => `<option value="${k}"${Q.deck === k ? ' selected' : ''}>${l} (${counts[k] || 0})</option>`).join('')}</select>
+      <select id="qScope" aria-label="범위"><option value="crime"${Q.scope === 'crime' ? ' selected' : ''}>이 죄</option><option value="chap"${Q.scope === 'chap' ? ' selected' : ''}>이 장</option><option value="all"${Q.scope === 'all' ? ' selected' : ''}>전체</option></select>
+      <select id="qOrder" aria-label="순서"><option value="due"${Q.order === 'due' ? ' selected' : ''}>복습할 것 먼저</option><option value="seq"${Q.order === 'seq' ? ' selected' : ''}>원문 순서</option><option value="rand"${Q.order === 'rand' ? ' selected' : ''}>무작위</option></select>
+      <label style="font-size:13px"><input type="checkbox" id="qWrong"${Q.wrong ? ' checked' : ''}> 틀린 것만</label>
+      <span class="qstat">${Q.queue.length ? `${Math.min(Q.i + 1, Q.queue.length)} / ${Q.queue.length}` : '0'} · 익힘 ${known}/${scopePool.length}</span></div>`;
+    const card = Q.queue[Q.i];
+    if (!card) h += `<div class="qcard"><div class="qempty">${Q.queue.length ? '이 묶음을 다 봤습니다. 범위나 순서를 바꿔 다시 시작하세요.' : '이 범위에는 해당 카드가 없습니다.'}</div><div class="row" style="justify-content:center"><button class="qbtn" id="qRestart">처음부터</button></div></div>`;
+    else h += quizCardHTML(card);
+    $('#quiz').innerHTML = h + '</div>';
+  }
+  function ctxOf(node) {
+    const parts = [];
+    const crime = crimeOf(node);
+    for (const a of ancestors(node).reverse()) {
+      if (a.k === 'el') parts.push(T(a).trim());
+      else if (a.k === 'p') parts.push(T(a).trim().slice(0, 30) + (T(a).trim().length > 30 ? '…' : ''));
+    }
+    return [crime ? crimeName(crime) : '', ...parts].filter(Boolean).map(esc).join(' › ');
+  }
+  function quizCardHTML(k) {
+    const n = k.node, t = T(n);
+    const grade3 = `<div class="row"><button class="qbtn" data-qg="0">몰랐음<kbd>1</kbd></button><button class="qbtn" data-qg="1">헷갈림<kbd>2</kbd></button><button class="qbtn primary" data-qg="2">알았음<kbd>3</kbd></button><button class="qbtn" data-qmap="${n.id}">맵에서 보기</button></div>`;
+    const revealBtn = `<div class="row"><button class="qbtn primary" id="qReveal">답 보기<kbd>Space</kbd></button></div>`;
+    let h = `<div class="qcard" data-card="${k.id}">`;
+    if (k.type === 'el') {
+      const items = [];
+      for (const x of kidsOf(k.crime.node)) {
+        if (x.k !== 'el') continue;
+        items.push({ x, box: false });
+        for (const y of kidsOf(x)) if (y.k === 'el') items.push({ x: y, box: true });
+      }
+      const arts = (k.crime.node.arts || []).join(' · ');
+      h += `<div class="ctx">${esc(k.crime.chap ? k.crime.chap.node.title || '' : '')}</div><div class="prompt display">${esc(crimeName(k.crime.node))}의 구성요건을 순서대로 떠올려 보세요</div>${arts ? `<div class="ctx">조문: ${esc(arts)}</div>` : ''}`;
+      const slot = (it, i) => i < Q.step || Q.revealed ? txSpan(it.x) : `<span class="mk hide" style="display:inline-block;min-width:${Math.min(16, T(it.x).trim().length * .9 + 2)}em">&nbsp;</span>`;
+      let list = '', subOpen = false;
+      items.forEach((it, i) => {
+        if (it.box) { if (!subOpen) { list += '<ul>'; subOpen = true; } list += `<li>${slot(it, i)}</li>`; return; }
+        if (subOpen) { list += '</ul>'; subOpen = false; }
+        if (i) list += '</li>';
+        list += `<li>${slot(it, i)}`;
+      });
+      if (subOpen) list += '</ul>';
+      h += `<ol class="qlist">${list}${items.length ? '</li>' : ''}</ol>`;
+      if (Q.revealed || Q.step >= items.length) h += grade3;
+      else h += `<div class="row"><button class="qbtn primary" id="qStep">하나씩 보기<kbd>Space</kbd></button><button class="qbtn" id="qReveal">모두 보기</button></div>`;
+    } else if (k.type === 'art') {
+      const p = k.para, els = p.art.els;
+      const marks = [{ s: p.art.name[0], e: p.art.name[1], cls: 'art-name' }].concat(els.map(([a, b], i) => ({ s: a, e: b, cls: i < Q.step || Q.revealed ? 'shown' : 'hide' })));
+      h += `<div class="ctx">${esc(crimeName(k.crime.node))} · 조문 요건 ${els.length}개</div><div class="prompt" style="font-family:var(--f-display)">${txSpan(p, marks)}</div>`;
+      if (Q.revealed || Q.step >= els.length) h += grade3;
+      else h += `<div class="row"><button class="qbtn primary" id="qStep">요건 하나씩<kbd>Space</kbd></button><button class="qbtn" id="qReveal">모두 보기</button></div>`;
+    } else if (k.type === 'ox') {
+      const ox = n.ox, need = ox.v.length;
+      const done = Q.answers.length >= need;
+      let marks;
+      if (ox.q) {
+        h += `<div class="ctx">${ctxOf(n)}</div><div class="prompt">${segsHTML(sliceSegs(n.s, 0, ox.q[1]))}</div>`;
+        if (done) {
+          const right = ox.v.every((v, i) => t[v] === Q.answers[i]);
+          marks = ox.v.map((v, i) => ({ s: v, e: v + 1, cls: 'v-' + t[v] }));
+          h += `<div class="answer"><span class="qres ${right ? 'ok' : 'ng'}">${right ? '정답' : '오답'} — 내 답: ${Q.answers.join(' · ')}</span><br>${txSpan(n, marks)}</div>` + grade3.replace('data-qg="2"', right ? 'data-qg="2" autofocus' : 'data-qg="2"');
+        } else {
+          const blanks = ox.v.map((v, i) => ({ s: v, e: v + 1, cls: i < Q.answers.length ? 'v-' + Q.answers[i] : 'hide' }));
+          h += `<div class="answer">${segsHTML(sliceSegs(n.s, ox.a[0], t.length), blanks.map(b => ({ ...b, s: b.s - ox.a[0], e: b.e - ox.a[0] })))}</div>`;
+          h += `<div class="row"><button class="qbtn o" data-ox="O">O<kbd>O</kbd></button><button class="qbtn x" data-ox="X">X<kbd>X</kbd></button><span class="qstat" style="align-self:center">판정 ${Q.answers.length + 1}/${need}</span></div>`;
+        }
+      } else {
+        h += `<div class="ctx">${ctxOf(n)}</div>`;
+        if (done) {
+          const right = ox.v.every((v, i) => t[v] === Q.answers[i]);
+          h += `<div class="prompt">${txSpan(n, verdictMarks(n))}</div><div class="answer"><span class="qres ${right ? 'ok' : 'ng'}">${right ? '정답' : '오답'} — 내 답: ${Q.answers.join(' · ')}</span></div>` + grade3;
+        } else {
+          marks = ox.v.map((v, i) => ({ s: v, e: v + 1, cls: i < Q.answers.length ? 'v-' + Q.answers[i] : 'hide' }));
+          h += `<div class="prompt">${txSpan(n, marks)}</div><div class="row"><button class="qbtn o" data-ox="O">O<kbd>O</kbd></button><button class="qbtn x" data-ox="X">X<kbd>X</kbd></button><span class="qstat" style="align-self:center">판정 ${Q.answers.length + 1}/${need}</span></div>`;
+        }
+      }
+    } else if (k.type === 'def') {
+      h += `<div class="ctx">${ctxOf(n)}</div><div class="prompt display">‘${esc(n.term || '')}’의 정의는?${n.mn ? ` <span class="badge mn">${esc(n.mn)}</span>` : ''}</div>`;
+      h += Q.revealed ? `<div class="answer">${txSpan(n)}</div>` + grade3 : revealBtn;
+    } else if (k.type === 'yak') {
+      h += `<div class="ctx">${ctxOf(n)}</div><div class="prompt">${txSpan(n)}</div>`;
+      if (Q.revealed) {
+        const anchor = ancestors(n).find(a => a.k === 'el') || parentOf(n);
+        h += `<div class="answer"><div class="ref">${refHTML(anchor, 0, n.id)}</div></div>` + grade3;
+      } else h += revealBtn.replace('답 보기', '관련 법리 보기');
+    } else if (k.type === 'hong') {
+      const par = parentOf(n);
+      h += `<div class="ctx">${ctxOf(n)}</div><div class="prompt">${par && par.k !== 'crime' ? `<span style="color:var(--ink-3)">이 부분의 채점 포인트는?</span>\n${segsHTML(par.s || [])}` : '이 부분의 채점 포인트는?'}</div>`;
+      h += Q.revealed ? `<div class="answer">${txSpan(n)}</div>` + grade3 : revealBtn;
+    }
+    return h + '</div>';
+  }
+  function sliceSegs(segs, a, b) {
+    const out = []; let off = 0;
+    for (const sg of segs) {
+      if (sg.length === 3) { if (off >= a && off <= b) out.push(sg); continue; }
+      const s = Math.max(a, off), e = Math.min(b, off + sg[0].length);
+      if (e > s) out.push([sg[0].slice(s - off, e - off), sg[1]]);
+      off += sg[0].length;
+    }
+    return out;
+  }
+  function refHTML(n, depth, skip) {
+    if (!n || depth > 3) return '';
+    const lines = [];
+    if (n.s && n.id !== skip) lines.push(`<div style="padding-left:${depth * 1.1}em;margin:2px 0">${n.b ? `<span class="bul">${esc(n.b)}</span> ` : ''}${segsHTML(n.s, n.ox ? verdictMarks(n) : [])}</div>`);
+    for (const ch of kidsOf(n)) if (ch.k === 'p' || ch.k === 'el') lines.push(refHTML(ch, depth + 1, skip));
+    return lines.join('');
+  }
+  function quizNext(g) {
+    const card = Q.queue[Q.i];
+    if (card && g != null) grade(card.id, g);
+    Q.i++; resetCard(); renderQuiz();
+  }
+  function quizAdvance() {
+    const card = Q.queue[Q.i];
+    if (!card) return;
+    if (card.type === 'el' || card.type === 'art') {
+      const total = card.type === 'art' ? card.para.art.els.length : $$('#quiz .qlist li').length;
+      if (Q.step < total && !Q.revealed) Q.step++; else Q.revealed = true;
+    } else Q.revealed = true;
+    renderQuiz();
+  }
+
+  // ───────────── 검색 ─────────────
+  function buildSearch() {
+    const items = [];
+    const add = (p, node) => { const t = T(p); if (!t.trim()) return; const n = normText(t); items.push({ p, node, t, n, ch: chosung(n) }); };
+    (function walk(x) {
+      if (x.s && x.pid && x.k !== 'sp' && x.k !== 'sep') add(x, x);
+      if (x.cells) (function cells(cl, owner) { for (const c of cl) for (const p of c.ps) p.tbl ? cells(p.tbl.cells, owner) : add(p, owner); })(x.cells, x);
+      (x.c || []).forEach(walk);
+    })(D.root);
+    IDX.search = items;
+  }
+  function doSearch(q) {
+    const box = $('#results');
+    q = q.trim();
+    if (!q) { box.hidden = true; return; }
+    if (!IDX.search) buildSearch();
+    const nq = normText(q), isCho = /^[ㄱ-ㅎ]+$/.test(nq);
+    const res = [];
+    for (const it of IDX.search) {
+      const i = isCho ? it.ch.indexOf(nq) : it.n.indexOf(nq);
+      if (i >= 0) { res.push(it); if (res.length >= 80) break; }
+    }
+    const re = isCho ? null : new RegExp(Array.from(nq, c => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*'));
+    box.innerHTML = res.length ? res.map((it, k) => {
+      const ci = crimeIdxOf(it.node);
+      let snip = it.t.replace(/\s+/g, ' ');
+      const m = re && re.exec(snip);
+      if (m) { const a = Math.max(0, m.index - 24); snip = (a ? '…' : '') + esc(snip.slice(a, m.index)) + '<em>' + esc(m[0]) + '</em>' + esc(snip.slice(m.index + m[0].length, m.index + m[0].length + 50)) + '…'; }
+      else snip = esc(snip.slice(0, 80));
+      return `<button class="r" data-hit="${k}"><small>${esc(ci >= 0 ? crimeName(IDX.crimes[ci].node) : '')}</small>${snip}</button>`;
+    }).join('') : '<div class="none">찾는 말이 없습니다.</div>';
+    box._res = res;
+    box.hidden = false;
+  }
+
+  // ───────────── 각주 · 대화상자 ─────────────
+  function showFootnote(el) {
+    closePop();
+    const k = el.dataset.fn, ps = FN[k] || [];
+    const pop = document.createElement('div');
+    pop.className = 'pop'; pop.id = 'pop';
+    pop.innerHTML = `<div class="fnno">각주 ${esc(k)}</div>${ps.map(p => p.tbl ? tableHTML(p.tbl) : `<p>${txSpan(p)}</p>`).join('')}`;
+    document.body.appendChild(pop);
+    const r = el.getBoundingClientRect();
+    const w = pop.offsetWidth, hgt = pop.offsetHeight;
+    pop.style.left = clamp(r.left - 20, 16, innerWidth - w - 16) + 'px';
+    pop.style.top = (r.bottom + 8 + hgt > innerHeight - 8 ? Math.max(8, r.top - hgt - 8) : r.bottom + 8) + 'px';
+  }
+  function closePop() { const p = $('#pop'); if (p) p.remove(); }
+  function dialog(html) {
+    closeDialog();
+    const d = document.createElement('div');
+    d.className = 'dialog'; d.id = 'dlg';
+    d.innerHTML = `<div class="box" role="dialog" aria-modal="true">${html}<div class="row"><button class="qbtn" data-close>닫기</button></div></div>`;
+    d.addEventListener('click', e => { if (e.target === d || e.target.closest('[data-close]')) closeDialog(); });
+    document.body.appendChild(d);
+    return d;
+  }
+  function closeDialog() { const d = $('#dlg'); if (d) d.remove(); }
+  function showHelp() {
+    const rows = [['/', '검색'], ['1 · 2 · 3', '펼치기 단계 (구성요건 / +법리 / 전부)'], ['S · H · C', '보기 / 가리기 / 빈칸'], ['← → ↑ ↓', '맵에서 이동 · 펼치기 · 접기'], ['Space · Enter', '가린 카드 보기 · 펼치기'],
+      ['F', '화면에 맞추기'], ['+ / −', '확대 / 축소 (Ctrl+휠도 가능)'], ['L', '가로 맵 ↔ 세로 목록'], ['[ · ]', '이전 죄 / 다음 죄'], ['M · O · Q · R', '마인드맵 / 전체 지도 / 암기 카드 / 원문'],
+      ['카드에서 O · X', '판례 판정 답하기'], ['카드에서 1 · 2 · 3', '몰랐음 / 헷갈림 / 알았음'], ['Esc', '팝업 닫기']];
+    dialog(`<h2>단축키</h2><table>${rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('')}</table>`);
+  }
+  function showInfo() {
+    const cards = IDX.crimes.reduce((a, c) => a + c.cards.length, 0);
+    const known = Object.values(P.cards).filter(s => s.b >= 2).length;
+    const cover = (D.meta.cover || []).map(p => p.tbl ? '' : `<p>${segsHTML(p.s)}</p>`).join('');
+    const fn1 = FN['1'] ? FN['1'].map(p => p.tbl ? '' : `<p style="color:var(--ink-3);font-size:12.5px">${segsHTML(p.s)}</p>`).join('') : '';
+    const d = dialog(`<h2>자료 정보</h2><div class="cover">${cover}${fn1}</div>
+      <p style="font-size:13.5px">죄 ${IDX.crimes.length}개 · 암기 카드 ${cards}장 · 익힘 ${known}장</p>
+      <p style="font-size:12.5px;color:var(--ink-3)">진도는 이 브라우저에만 저장됩니다. 다른 기기로 옮기거나 지우기 전에 백업하세요.</p>
+      <div class="row"><button class="qbtn" id="expBtn">진도 내보내기</button><label class="qbtn" style="cursor:pointer">진도 가져오기<input type="file" id="impIn" accept=".json" hidden></label><button class="qbtn" id="resetBtn">진도 초기화</button></div>
+      <p id="resetAsk" hidden style="font-size:13px">정말 모든 진도를 지울까요? <button class="qbtn" id="resetYes">지우기</button></p>`);
+    $('#expBtn', d).onclick = () => {
+      const blob = new Blob([JSON.stringify({ key: KEY, saved: new Date().toISOString(), progress: P })], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'mindmap-progress.json'; document.body.appendChild(a); a.click(); a.remove();
+      toast('진도를 파일로 저장했습니다');
+    };
+    $('#impIn', d).onchange = e => {
+      const f = e.target.files[0]; if (!f) return;
+      f.text().then(t => { const j = JSON.parse(t); const pr = j.progress || j; if (!pr.cards) throw new Error('형식이 다릅니다'); P = pr; store.set(KEY + ':progress', P); updateTOCProgress(); toast('진도를 가져왔습니다'); closeDialog(); })
+        .catch(err => toast('가져오지 못했습니다: ' + err.message));
+    };
+    $('#resetBtn', d).onclick = () => { $('#resetAsk', d).hidden = false; };
+    $('#resetYes', d).onclick = () => { P = { v: 1, cards: {} }; store.set(KEY + ':progress', P); updateTOCProgress(); toast('진도를 지웠습니다'); closeDialog(); };
+  }
+  function cycleTheme() {
+    const r = document.documentElement, cur = r.dataset.theme;
+    const next = !cur ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'light' : 'dark') : cur === 'dark' ? 'light' : 'dark';
+    r.dataset.theme = next;
+    store.set('hv:theme', next);
+    scheduleWires();
+  }
+
+  // ───────────── 입력 ─────────────
+  function bindUI() {
+    $$('.views button').forEach(b => b.onclick = () => setView(b.dataset.view));
+    $('#toc').addEventListener('click', e => { const b = e.target.closest('[data-ci]'); if (b) { if (S.view === 'overview') S.view = 'map'; openCrime(+b.dataset.ci); if (S.view === 'map') setView('map'); } });
+    $('#menuBtn').onclick = () => $('#side').classList.toggle('open');
+    $('#helpBtn').onclick = showHelp;
+    $('#infoBtn').onclick = showInfo;
+    $('#themeBtn').onclick = cycleTheme;
+    $$('#modeSeg button').forEach(b => b.onclick = () => setMode(b.dataset.mode));
+    $$('#levelSeg button').forEach(b => b.onclick = () => setLevel(+b.dataset.level));
+    $('#zoomIn').onclick = () => setZoom(S.z + 0.1);
+    $('#zoomOut').onclick = () => setZoom(S.z - 0.1);
+    $('#zoomFit').onclick = fit;
+    $('#layoutBtn').onclick = () => { S.outline = !S.outline; saveUI(); renderMap(); };
+
+    const q = $('#q');
+    let st = 0;
+    q.addEventListener('input', () => { clearTimeout(st); st = setTimeout(() => doSearch(q.value), 120); });
+    q.addEventListener('keydown', e => {
+      const box = $('#results'), items = $$('.r', box); let i = items.findIndex(x => x.classList.contains('sel'));
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); i = clamp(i + (e.key === 'ArrowDown' ? 1 : -1), 0, items.length - 1); items.forEach((x, j) => x.classList.toggle('sel', j === i)); items[i] && items[i].scrollIntoView({ block: 'nearest' }); }
+      else if (e.key === 'Enter') { (items[i] || items[0]) && (items[i] || items[0]).click(); }
+      else if (e.key === 'Escape') { box.hidden = true; q.blur(); }
+    });
+    $('#results').addEventListener('click', e => {
+      const b = e.target.closest('[data-hit]'); if (!b) return;
+      const it = $('#results')._res[+b.dataset.hit];
+      $('#results').hidden = true;
+      goToNode(it.node);
+    });
+    document.addEventListener('click', e => {
+      if (!e.target.closest('.search')) $('#results').hidden = true;
+      if (!e.target.closest('.pop') && !e.target.closest('sup.fn')) closePop();
+      const fn = e.target.closest('sup.fn');
+      if (fn) { e.stopPropagation(); showFootnote(fn); }
+    }, true);
+
+    // 맵 클릭
+    const canvas = $('#mmCanvas');
+    canvas.addEventListener('click', e => {
+      if (e.target.closest('sup.fn')) return;
+      if (dragMoved) return;
+      const g = e.target.closest('[data-g]');
+      if (g) { grade(g.dataset.card, +g.dataset.g); rerenderCard(g.closest('.card').dataset.id); return; }
+      const tog = e.target.closest('[data-tog]');
+      if (tog) { toggleNode(tog.dataset.tog); return; }
+      const more = e.target.closest('.more');
+      if (more) { const id = more.closest('.card').dataset.id; S.unclamp.has(id) ? S.unclamp.delete(id) : S.unclamp.add(id); rerenderCard(id); return; }
+      const mk = e.target.closest('.mk.hide, .mk.blank');
+      if (mk && mk.dataset.k) {
+        S.rev.add(mk.dataset.k);
+        const owner = mk.closest('[data-id]');
+        if (owner && owner.classList.contains('card') && !owner.classList.contains('k-root')) rerenderCard(owner.dataset.id); else renderMap();
+        return;
+      }
+      const li = e.target.closest('.stat-notes li.concealed');
+      if (li) { S.rev.add(li.dataset.id); renderMap(); return; }
+      const card = e.target.closest('.card');
+      if (!card) return;
+      const id = card.dataset.id, n = IDX.byId.get(id);
+      if (card.classList.contains('concealed')) { revealNode(n); rerenderCard(id); select(id); return; }
+      if (card.classList.contains('k-root')) return;
+      select(id);
+      if (window.getSelection && String(window.getSelection()).length > 2) return;
+      if (kidsOf(n).length) toggleNode(id);
+    });
+    canvas.addEventListener('mouseover', e => {
+      const chip = e.target.closest('.k-el');
+      const ae = e.target.closest('.art-el');
+      $$('#mmCanvas .hl').forEach(x => x.classList.remove('hl'));
+      if (chip) {
+        const n = IDX.byId.get(chip.dataset.id);
+        (n && n.ln || []).forEach(([a, el]) => $$(`#mmCanvas .ae-${a}-${el}`).forEach(x => x.classList.add('hl')));
+      } else if (ae) {
+        const m = /ae-(\d+)-(\d+)/.exec(ae.className);
+        if (m) $$('#mmCanvas .k-el').forEach(c => { const n = IDX.byId.get(c.dataset.id); if (n && n.ln && n.ln.some(([a, el]) => a === +m[1] && el === +m[2])) c.classList.add('hl'); });
+      }
+    });
+
+    // 끌어서 이동 · Ctrl+휠 확대
+    const vp = $('#mmViewport');
+    let drag = null, dragMoved = false;
+    vp.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || e.target.closest('.card') || S.outline) return;
+      drag = { x: e.clientX, y: e.clientY, sl: vp.scrollLeft, st: vp.scrollTop, id: e.pointerId }; dragMoved = false;
+    });
+    vp.addEventListener('pointermove', e => {
+      if (!drag) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (!dragMoved && Math.abs(dx) + Math.abs(dy) > 4) { dragMoved = true; vp.classList.add('dragging'); try { vp.setPointerCapture(drag.id); } catch (err) { /* 무시 */ } }
+      if (dragMoved) { vp.scrollLeft = drag.sl - dx; vp.scrollTop = drag.st - dy; }
+    });
+    const endDrag = () => { if (drag) { vp.classList.remove('dragging'); drag = null; setTimeout(() => { dragMoved = false; }, 0); } };
+    vp.addEventListener('pointerup', endDrag);
+    vp.addEventListener('pointercancel', endDrag);
+    vp.addEventListener('wheel', e => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const r = vp.getBoundingClientRect();
+      setZoom(S.z * (e.deltaY < 0 ? 1.08 : 1 / 1.08), { x: e.clientX - r.left, y: e.clientY - r.top });
+    }, { passive: false });
+    new ResizeObserver(scheduleWires).observe(canvas);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(scheduleWires);
+
+    // 원문 · 지도 · 카드
+    $('#reader').addEventListener('click', e => { const b = e.target.closest('[data-go]'); if (b) openCrime(+b.dataset.go, { keepView: true }); });
+    $('#overview').addEventListener('click', e => {
+      const li = e.target.closest('[data-ov]');
+      if (li) {
+        if (li.classList.contains('concealed')) { S.rev.add('ov:' + li.dataset.ov); li.classList.remove('concealed'); return; }
+        goToNode(IDX.byId.get(li.dataset.ov)); return;
+      }
+      const b = e.target.closest('[data-ci]');
+      if (b) { S.view = 'map'; S.ci = +b.dataset.ci; setView('map'); }
+    });
+    $('#quiz').addEventListener('change', e => {
+      if (e.target.id === 'qDeck') Q.deck = e.target.value;
+      if (e.target.id === 'qScope') Q.scope = e.target.value;
+      if (e.target.id === 'qOrder') Q.order = e.target.value;
+      if (e.target.id === 'qWrong') Q.wrong = e.target.checked;
+      renderQuiz(true);
+    });
+    $('#quiz').addEventListener('click', e => {
+      const t = e.target.closest('button'); if (!t) return;
+      if (t.id === 'qRestart') { renderQuiz(true); return; }
+      if (t.id === 'qReveal') { Q.revealed = true; renderQuiz(); return; }
+      if (t.id === 'qStep') { quizAdvance(); return; }
+      if (t.dataset.ox) { Q.answers.push(t.dataset.ox); renderQuiz(); return; }
+      if (t.dataset.qg) { quizNext(+t.dataset.qg); return; }
+      if (t.dataset.qmap) { goToNode(IDX.byId.get(t.dataset.qmap)); }
+    });
+
+    document.addEventListener('keydown', onKey);
+    addEventListener('resize', scheduleWires);
+  }
+
+  function setMode(m) {
+    S.mode = m; S.rev.clear();
+    $$('#modeSeg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === m)));
+    if (S.view === 'map') renderMap(); else if (S.view === 'overview') renderOverview();
+    saveUI();
+  }
+  function setLevel(l) { S.level = l; presetOpen(l); renderMap(); saveUI(); }
+
+  function visibleCards() { return $$('#mmCanvas .card').filter(c => c.offsetParent !== null); }
+  function onKey(e) {
+    if (e.target.closest && e.target.closest('input, select, textarea')) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const k = e.key;
+    if (k === 'Escape') { closePop(); closeDialog(); $('#results').hidden = true; return; }
+    if ($('#dlg')) return;
+    if (k === '/') { e.preventDefault(); $('#side').classList.add('open'); $('#q').focus(); return; }
+    if (k === '?') { showHelp(); return; }
+    if (k === '[' || k === ']') { openCrime(S.ci + (k === ']' ? 1 : -1), { keepView: true }); if (S.view === 'map') setView('map'); return; }
+    if (S.view === 'quiz') return quizKey(e);
+    const lower = k.toLowerCase();
+    if (lower === 'm') return setView('map');
+    if (lower === 'o') return setView('overview');
+    if (lower === 'q') return setView('quiz');
+    if (lower === 'r') return setView('read');
+    if (S.view !== 'map' && S.view !== 'overview') return;
+    if (lower === 's') return setMode('study');
+    if (lower === 'h') return setMode('hide');
+    if (lower === 'c') return setMode('cloze');
+    if (S.view !== 'map') return;
+    if (k === '1' || k === '2' || k === '3') return setLevel(+k);
+    if (lower === 'f') return fit();
+    if (lower === 'l') { S.outline = !S.outline; saveUI(); renderMap(); return; }
+    if (k === '+' || k === '=') return setZoom(S.z + 0.1);
+    if (k === '-') return setZoom(S.z - 0.1);
+    const cards = visibleCards();
+    if (!cards.length) return;
+    let cur = S.sel && $(`#mmCanvas .card[data-id="${S.sel}"]`);
+    if (!cur || cur.offsetParent === null) cur = null;
+    const n = cur && IDX.byId.get(cur.dataset.id);
+    if (k === 'ArrowDown' || k === 'ArrowUp') {
+      e.preventDefault();
+      const i = cur ? cards.indexOf(cur) : -1;
+      const nx = cards[clamp(i + (k === 'ArrowDown' ? 1 : -1), 0, cards.length - 1)];
+      select(nx.dataset.id, true);
+    } else if (k === 'ArrowRight') {
+      e.preventDefault();
+      if (!n) { select(cards[0].dataset.id, true); return; }
+      if (kidsOf(n).length && !S.open.has(n.id) && !cur.classList.contains('k-root')) toggleNode(n.id, true);
+      else { const first = cur.parentElement.querySelector(':scope > .mm-kids > .mm-node > .card'); if (first) select(first.dataset.id, true); }
+    } else if (k === 'ArrowLeft') {
+      e.preventDefault();
+      if (!n) return;
+      if (kidsOf(n).length && S.open.has(n.id)) toggleNode(n.id, false);
+      else { const up = cur.parentElement.parentElement.closest('.mm-node'); if (up) select(up.firstElementChild.dataset.id, true); }
+    } else if (k === ' ' || k === 'Enter') {
+      if (!n) return;
+      e.preventDefault();
+      if (cur.classList.contains('concealed') || (S.mode !== 'study' && cur.querySelector('.mk.hide, .mk.blank'))) {
+        if (cur.classList.contains('concealed')) revealNode(n);
+        else $$('.mk.hide, .mk.blank', cur).forEach(m => m.dataset.k && S.rev.add(m.dataset.k));
+        if (cur.classList.contains('k-root')) renderMap(); else rerenderCard(n.id);
+        select(n.id);
+      } else if (kidsOf(n).length && !cur.classList.contains('k-root')) toggleNode(n.id);
+    }
+  }
+  function quizKey(e) {
+    const k = e.key.toLowerCase();
+    const card = Q.queue[Q.i];
+    if (!card) return;
+    const gradeVisible = !!$('#quiz [data-qg]');
+    if (gradeVisible && (k === '1' || k === '2' || k === '3')) { e.preventDefault(); quizNext(+k - 1); return; }
+    if (card.type === 'ox' && (k === 'o' || k === 'x') && !gradeVisible) { e.preventDefault(); Q.answers.push(k.toUpperCase()); renderQuiz(); return; }
+    if (k === ' ' || k === 'enter') {
+      e.preventDefault();
+      if (gradeVisible) { quizNext(2); return; }
+      if (card.type === 'el' || card.type === 'art') quizAdvance(); else if (card.type !== 'ox') { Q.revealed = true; renderQuiz(); }
+    }
+  }
+
+  // 테스트·자동화용 훅
+  window.__hv = {
+    get state() { return S; }, idx: () => IDX, open: ci => openCrime(ci), view: setView, mode: setMode, level: setLevel,
+    expandAll: () => { setLevel(3); }, crimes: () => IDX.crimes.length, data: () => D,
+  };
+
+  SHELL = document.body.innerHTML;
+  boot();
+})();
