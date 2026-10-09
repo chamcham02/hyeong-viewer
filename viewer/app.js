@@ -1,6 +1,7 @@
 /* hyeong-viewer — 정리자료 트리(JSON)를 가로 마인드맵 · 암기 카드 · 원문 보기로 보여 준다.
    데이터는 <script id="tree-data" type="application/json">에 인라인되거나, 파일로 불러온다.
-   원문 텍스트는 바꾸지 않는다: 화면의 .tx[data-pid] 안에는 원문 글자만 들어가고, 장식은 .deco로 구분한다. */
+   원문 텍스트는 바꾸지 않는다: 화면의 .tx[data-pid] 안에는 원문 글자만 들어가고, 장식은 .deco로 구분한다.
+   예외는 하나: 변환기가 '양식상 들어간 줄바꿈'(sb)으로 표시한 Shift+Enter는 띄어쓰기로 보여 준다. */
 (() => {
   'use strict';
 
@@ -25,45 +26,44 @@
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 저장 불가 환경 */ } },
   };
   function toast(msg) {
+    $$('.toast').forEach(t => t.remove());
     const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg; document.body.appendChild(t);
     setTimeout(() => t.remove(), 1800);
   }
+  const ISSUE_RE = /고의|죄수|가담|위법성|미수|친고|반의사|인과관계|예비|음모|처벌|기수|병과/;
 
   // ───────────── 상태 ─────────────
   let D = null, FM = [], FN = {};
   const IDX = { byId: new Map(), parent: new Map(), crimes: [], chaps: [], cardsById: new Map(), search: null };
   const S = {
-    view: 'map', mode: 'study', ci: 0, level: 1, z: 1, outline: false, sel: null,
-    open: new Set(), rev: new Set(), unclamp: new Set(),
+    view: 'map', mode: 'study', ci: 0, level: 1, z: 1, outline: false, single: true, sel: null, act: null,
+    open: new Set(), rev: new Set(),
   };
   let KEY = 'hv';
   let P = { v: 1, cards: {} };
 
   // ───────────── 시작 ─────────────
+  let SHELL = '';
   function boot() {
     const raw = $('#tree-data').textContent.trim();
     if (raw) { try { start(JSON.parse(raw)); return; } catch (e) { console.error(e); } }
     showLoader();
   }
-
   function showLoader() {
-    const app = $('#app');
-    app.innerHTML = `<div class="loader"><div class="drop" id="drop">
+    $('#app').innerHTML = `<div class="loader"><div class="drop" id="drop">
       <h1>정리자료 마인드맵</h1>
       <p>변환한 <code>tree.json</code> 파일을 여기에 끌어다 놓거나 아래에서 고르세요.</p>
       <p><input type="file" id="fileIn" accept=".json,application/json"></p>
       <p style="font-size:13px">파일은 이 브라우저 안에서만 열리고 어디에도 올라가지 않습니다.<br>
       변환: <code>python3 -I convert/hwpx2tree.py 자료.hwpx -o tree.json</code></p></div></div>`;
     const drop = $('#drop');
-    const read = f => f.text().then(t => { location.hash = ''; document.body.innerHTML = ''; rebuildShell(); start(JSON.parse(t)); })
+    const read = f => f.text().then(t => { const data = JSON.parse(t); document.body.innerHTML = SHELL; start(data); })
       .catch(err => { drop.querySelector('p').textContent = 'JSON을 읽지 못했습니다: ' + err.message; });
     $('#fileIn').addEventListener('change', e => e.target.files[0] && read(e.target.files[0]));
     drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
     drop.addEventListener('dragleave', () => drop.classList.remove('over'));
     drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && read(e.dataTransfer.files[0]); });
   }
-  let SHELL = '';
-  function rebuildShell() { document.body.innerHTML = SHELL; }
 
   function start(data) {
     D = data; FM = D.fmts; FN = D.fns || {};
@@ -72,7 +72,10 @@
     KEY = 'hv:' + hash(name + '|' + IDX.crimes.length);
     P = store.get(KEY + ':progress', { v: 1, cards: {} });
     const ui = store.get(KEY + ':ui', {});
-    Object.assign(S, { ci: clamp(ui.ci | 0, 0, IDX.crimes.length - 1), level: ui.level || 1, z: ui.z || 1, mode: ui.mode || 'study', view: ui.view || 'map' });
+    Object.assign(S, {
+      ci: clamp(ui.ci | 0, 0, IDX.crimes.length - 1), level: ui.level || 1, z: ui.z || 1, mode: ui.mode || 'study',
+      view: ui.view || 'map', single: ui.single != null ? ui.single : true,
+    });
     S.outline = ui.outline != null ? ui.outline : matchMedia('(max-width: 860px)').matches;
     const theme = store.get('hv:theme', null);
     if (theme) document.documentElement.dataset.theme = theme;
@@ -85,7 +88,7 @@
     bindUI();
     const hm = /^#c-(\d+)$/.exec(location.hash);
     if (hm) S.ci = clamp(+hm[1], 0, IDX.crimes.length - 1);
-    setView(S.view, true);
+    setView(S.view);
   }
 
   // ───────────── 색인 ─────────────
@@ -107,6 +110,12 @@
   function ancestors(n) { const out = []; for (let x = parentOf(n); x; x = parentOf(x)) out.push(x); return out; }
   const kidsOf = n => (n.c || []).filter(x => x.k !== 'sp' && x.k !== 'sep');
   const crimeName = n => n.name || T(n).replace(/^\s*\[|\]\s*$/g, '');
+  const isIssue = n => n.k === 'el' && !n.ln && ISSUE_RE.test(T(n));
+  function topBranchOf(n) { // 죄 바로 아래 가지
+    let x = n;
+    for (let p = parentOf(x); p; x = p, p = parentOf(p)) if (p.k === 'crime') return x;
+    return null;
+  }
 
   // ───────────── 원문 글자 렌더링 ─────────────
   const FCLS = [];
@@ -120,7 +129,31 @@
   }
   const isBlue = i => { const f = FM[i] || {}; return f.c === '#0000FF' || f.c === '#0432FF'; };
 
-  /* segs → HTML. marks: [{s,e,cls,key}] (겹치지 않게 정리됨). 각주 앵커는 .deco sup */
+  /* 표시용 글자 조각: 양식 줄바꿈(sb)만 띄어쓰기로 바꾼다. 길이는 그대로라 모든 오프셋이 유지된다. */
+  function dispSegs(p) {
+    if (!p.sb || !p.sb.length) return p.s || [];
+    if (p._ds) return p._ds;
+    const set = new Set(p.sb), full = T(p), out = [];
+    let off = 0;
+    for (const sg of p.s) {
+      if (sg.length === 3) { out.push(sg); continue; }
+      let t = sg[0];
+      if (t.includes('\n')) {
+        t = Array.from(t, (ch, i) => {
+          if (ch !== '\n' || !set.has(off + i)) return ch;
+          const prev = full[off + i - 1] || ' ';
+          return /\s/.test(prev) ? '​' : ' ';
+        }).join('');
+      }
+      out.push([t, sg[1]]);
+      off += sg[0].length;
+    }
+    return (p._ds = out);
+  }
+  /** 화면에 보이는 글자열(테스트에서도 같은 규칙을 쓴다) */
+  const displayText = p => dispSegs(p).map(s => s[0]).join('');
+
+  /* segs → HTML. marks: [{s,e,cls,key}] (겹치면 앞의 것이 이긴다). 각주 앵커는 .deco sup */
   function segsHTML(segs, marks) {
     marks = normMarks(marks || []);
     let out = '', off = 0, mi = 0, open = null;
@@ -150,7 +183,7 @@
     for (const m of ms) { if (!out.length || m.s >= out[out.length - 1].e) out.push(m); }
     return out;
   }
-  const txSpan = (p, marks, extra = '') => `<span class="tx${extra}" data-pid="${esc(p.pid)}">${segsHTML(p.s, marks)}</span>`;
+  const txSpan = (p, marks, extra = '') => `<span class="tx${extra}" data-pid="${esc(p.pid)}">${segsHTML(dispSegs(p), marks)}</span>`;
 
   // 핵심어(밑줄·굵게, 파란 메모 제외) 구간
   function keyRanges(n) {
@@ -166,12 +199,9 @@
       const v = i < flags.length ? flags[i] : 0;
       if (v === 1) { if (s < 0) s = i; lastKey = i; } else if (v === 0 && s >= 0) { out.push([s, lastKey + 1]); s = -1; }
     }
-    return (n._kr = out.filter(([a, b]) => b - a >= 1));
+    return (n._kr = out);
   }
-  const verdictMarks = (n, cls, keyp) => (n.ox ? n.ox.v : []).map((v, i) => {
-    const ch = T(n)[v];
-    return { s: v, e: v + 1, cls: cls || ('v-' + ch), key: keyp ? `${n.id}:v${i}` : null };
-  });
+  const verdictMarks = n => (n.ox ? n.ox.v : []).map(v => ({ s: v, e: v + 1, cls: 'v-' + T(n)[v] }));
 
   // ───────────── 암기 카드(SRS) ─────────────
   const BOX_DAYS = [0, 1, 3, 7, 14, 30];
@@ -181,9 +211,12 @@
       const n = c.node, nm = crimeName(n);
       const heads = kidsOf(n).filter(x => x.k === 'el');
       if (heads.length) c.cards.push(mkCard('el', c, n, 'el:' + hash(nm)));
-      (function walk(x, ctx) {
+      (function walk(x) {
         if (x.k === 'stat') {
-          for (const cell of x.cells) for (const p of cell.ps) if (p.art && p.art.els) c.cards.push(mkCard('art', c, x, 'art:' + hash(nm + '|' + T(p)), { para: p }));
+          for (const cell of x.cells) for (const p of cell.ps) if (p.art && p.art.els && p.art.els.length) c.cards.push(mkCard('art', c, x, 'art:' + hash(nm + '|' + T(p)), { para: p }));
+        }
+        if (x.k === 'el' && kidsOf(x).some(k => k.k === 'p' && (k.lv === 'g' || k.lv === 'm'))) {
+          c.cards.push(mkCard('law', c, x, 'law:' + hash(nm + '|' + normText(T(x)))));
         }
         if (x.k === 'p') {
           const t = T(x), tags = x.tags || [];
@@ -192,14 +225,14 @@
           if (tags.includes('yak')) c.cards.push(mkCard('yak', c, x, 'yak:' + hash(nm + '|' + normText(t))));
           else if (tags.includes('hong')) c.cards.push(mkCard('hong', c, x, 'hong:' + hash(nm + '|' + normText(t))));
         }
-        (x.c || []).forEach(ch => walk(ch));
+        (x.c || []).forEach(walk);
       })(n);
     }
   }
   function mkCard(type, crime, node, id, extra) {
     const card = Object.assign({ type, crime, node, id }, extra || {});
     IDX.cardsById.set(id, card);
-    if (type === 'ox' || type === 'def') node._card = id;
+    if (type === 'ox' || type === 'def') node._card = node._card || id;
     return card;
   }
   const cardState = id => P.cards[id];
@@ -212,6 +245,7 @@
     P.cards[id] = st;
     store.set(KEY + ':progress', P);
     updateTOCProgress();
+    return st;
   }
   function crimeProgress(c) {
     const now = Date.now();
@@ -222,7 +256,6 @@
 
   // ───────────── 목차 ─────────────
   function renderTOC() {
-    const toc = $('#toc');
     let h = '';
     for (const ch of IDX.chaps) {
       if (ch.part) { h += `<div class="part">${esc(ch.part.title || '')}</div>`; continue; }
@@ -233,14 +266,14 @@
         h += `<button class="crime" data-ci="${c.idx}"><span>${esc(crimeName(c.node))}</span><span class="meta" data-meta="${c.idx}"></span><span class="bar"><i data-bar="${c.idx}"></i></span></button>`;
       }
     }
-    toc.innerHTML = h;
+    $('#toc').innerHTML = h;
     updateTOCProgress();
   }
   function updateTOCProgress() {
     for (const c of IDX.crimes) {
       const p = crimeProgress(c), bar = $(`[data-bar="${c.idx}"]`), meta = $(`[data-meta="${c.idx}"]`);
       if (bar) bar.style.width = p.total ? (100 * p.known / p.total).toFixed(1) + '%' : '0';
-      if (meta) meta.textContent = p.total ? `${p.known}/${p.total}` : '';
+      if (meta) { meta.textContent = p.total ? `${p.known}/${p.total}` : ''; meta.title = '익힌 카드 / 전체 카드'; }
     }
   }
   function markTOC() {
@@ -250,17 +283,27 @@
   }
 
   // ───────────── 보기 전환 ─────────────
-  function saveUI() { store.set(KEY + ':ui', { ci: S.ci, level: S.level, z: S.z, mode: S.mode, view: S.view, outline: S.outline }); }
-  function setView(v, first) {
-    S.view = v;
+  function saveUI() { store.set(KEY + ':ui', { ci: S.ci, level: S.level, z: S.z, mode: S.mode, view: S.view, outline: S.outline, single: S.single }); }
+  function syncToolbar() {
+    const v = S.view;
     $$('.views button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.view === v)));
+    $$('#modeSeg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === S.mode)));
+    $$('#levelSeg button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.level === S.level)));
+    $('#singleBtn').setAttribute('aria-pressed', String(S.single));
+    $('#levelSeg').hidden = $('#zoomCtl').hidden = $('#singleBtn').hidden = v !== 'map';
+    $('#modeSeg').hidden = v === 'quiz';
+    $('#modeSeg [data-mode="cloze"]').hidden = v === 'overview';
+    $('#recover').hidden = S.mode === 'study' || v === 'quiz';
+  }
+  function setView(v) {
+    S.view = v;
+    if (v === 'overview' && S.mode === 'cloze') S.mode = 'study';
     $('#mmViewport').hidden = v !== 'map';
     $('#overview').hidden = v !== 'overview';
     $('#quiz').hidden = v !== 'quiz';
     $('#reader').hidden = v !== 'read';
-    $('#levelSeg').hidden = $('#zoomCtl').hidden = v !== 'map';
-    $('#modeSeg').hidden = v === 'quiz' || v === 'read';
-    if (v === 'map') openCrime(S.ci, { keepView: true, first });
+    syncToolbar();
+    if (v === 'map') openCrime(S.ci, { keepView: true });
     else if (v === 'overview') renderOverview();
     else if (v === 'quiz') renderQuiz(true);
     else if (v === 'read') renderReader();
@@ -278,13 +321,12 @@
 
   function openCrime(ci, opt = {}) {
     S.ci = clamp(ci, 0, IDX.crimes.length - 1);
-    if (!opt.keepView && S.view !== 'map' && S.view !== 'read' && S.view !== 'quiz') S.view = 'map';
     markTOC();
     try { history.replaceState(null, '', '#c-' + S.ci); } catch (e) { /* file:// 등 */ }
     if (S.view === 'map') {
-      if (!opt.keepOpen) { S.rev.clear(); S.unclamp.clear(); presetOpen(S.level); }
+      if (!opt.keepOpen) { S.rev.clear(); S.act = null; S.sel = null; presetOpen(S.level); }
       renderMap();
-      if (!opt.noFit && !opt.target) requestAnimationFrame(() => { const vp = $('#mmViewport'); vp.scrollLeft = 0; vp.scrollTop = 0; });
+      if (!opt.target) { const vp = $('#mmViewport'); vp.scrollLeft = 0; vp.scrollTop = 0; }
     } else if (S.view === 'read') renderReader();
     else if (S.view === 'quiz') renderQuiz(true);
     updateCrumb();
@@ -293,52 +335,73 @@
   }
 
   // ───────────── 마인드맵 ─────────────
-  function presetOpen(level) {
-    S.open.clear();
-    const n = IDX.crimes[S.ci].node;
-    (function walk(x, d) {
+  const branches = () => kidsOf(IDX.crimes[S.ci].node).filter(x => x.k !== 'stat');
+  function subtreeIds(n, out = []) { for (const k of kidsOf(n)) { out.push(k.id); subtreeIds(k, out); } return out; }
+  function openPerLevel(n, level) { // n 자신과, 단계에 맞는 후손을 연다
+    if (kidsOf(n).length) S.open.add(n.id);
+    (function walk(x) {
       for (const ch of kidsOf(x)) {
         if (kidsOf(ch).length && (level >= 3 || (level >= 2 && ch.k === 'el'))) S.open.add(ch.id);
-        walk(ch, d + 1);
+        walk(ch);
       }
-    })(n, 0);
+    })(n);
+  }
+  function presetOpen(level) {
+    S.open.clear();
+    if (level <= 1) return;
+    const bs = branches();
+    if (S.single) {
+      const act = (S.act && bs.find(b => b.id === S.act)) || bs.find(b => kidsOf(b).length);
+      if (act) { S.act = act.id; openPerLevel(act, level); }
+    } else bs.forEach(b => openPerLevel(b, level));
   }
 
-  const HINT = n => n.k === 'el' ? (n.box ? '박스 요건' : '구성요건') : n.k === 'tbl' ? '비교표' : n.k === 'case' ? '사례 답안' :
+  const HINT = n => n.k === 'el' ? (n.box ? '박스 요건' : isIssue(n) ? '쟁점' : '구성요건') : n.k === 'tbl' ? '비교표' : n.k === 'case' ? '사례 답안' :
     ({ g: '법리', m: '중간분류', d: '세부', n: n.ox ? '판례 O/X' : '참조', x: '참조' })[n.lv] || '내용';
 
-  function cardMarks(n, keyBase) {
+  function cardMarks(n) {
     const t = T(n);
     if (S.mode === 'study') return n.ox ? verdictMarks(n) : [];
     if (S.mode === 'hide') {
       if (n.ox && n.ox.q) { const k = n.id + ':a'; return S.rev.has(k) ? verdictMarks(n) : [{ s: n.ox.a[0], e: t.length, cls: 'hide', key: k }]; }
-      if (n.ox) return n.ox.v.map((v, i) => { const k = `${n.id}:v${i}`; return { s: v, e: v + 1, cls: S.rev.has(k) ? 'v-' + t[v] : 'hide', key: k }; });
+      if (n.ox) return n.ox.v.map((v, i) => { const k = `${n.id}:v${i}`; return { s: v, e: v + 1, cls: S.rev.has(k) ? 'v-' + t[v] : 'hide vd', key: k }; });
       return [];
     }
-    // cloze
-    if (n.k === 'el') return [];
-    const ms = keyRanges(n).map(([a, b], i) => { const k = `${n.id}:k${i}`; return { s: a, e: b, cls: S.rev.has(k) ? 'shown' : 'blank', key: k }; });
-    return ms.concat((n.ox ? n.ox.v : []).map((v, i) => { const k = `${n.id}:v${i}`; return { s: v, e: v + 1, cls: S.rev.has(k) ? 'v-' + t[v] : 'blank', key: k }; }));
+    // 빈칸: 구성요건 제목은 통째로, 법리는 핵심어(밑줄·굵게)와 O/X 판정어
+    if (n.k === 'el') { const k = n.id + ':h'; return [{ s: 0, e: t.length, cls: S.rev.has(k) ? 'shown' : 'blank', key: k }]; }
+    const ms = (n.ox ? n.ox.v : []).map((v, i) => { const k = `${n.id}:v${i}`; return { s: v, e: v + 1, cls: S.rev.has(k) ? 'v-' + t[v] : 'blank vd', key: k }; });
+    return ms.concat(keyRanges(n).map(([a, b], i) => { const k = `${n.id}:k${i}`; return { s: a, e: b, cls: S.rev.has(k) ? 'shown' : 'blank', key: k }; }));
   }
   function conceals(n) {
     if (S.mode !== 'hide') return false;
-    if (n.k === 'p' && n.ox) return false; // O/X는 질문을 보여 주고 답만 가린다
+    if (n.k === 'p' && n.ox) return false; // O/X는 사안을 보여 주고 결론만 가린다
     return !S.rev.has(n.id);
+  }
+  function revealedAll(n) {
+    if (!n.ox) return S.rev.has(n.id);
+    if (n.ox.q) return S.rev.has(n.id + ':a');
+    return n.ox.v.every((_, i) => S.rev.has(`${n.id}:v${i}`));
+  }
+  function revealNode(n) {
+    if (n.ox && n.ox.q) S.rev.add(n.id + ':a');
+    else if (n.ox) n.ox.v.forEach((_, i) => S.rev.add(`${n.id}:v${i}`));
+    if (S.mode === 'cloze') { $$(`#mmCanvas .card[data-id="${n.id}"] .mk[data-k]`).forEach(m => S.rev.add(m.dataset.k)); }
+    S.rev.add(n.id);
   }
 
   function badgesHTML(n) {
     const tags = n.tags || [];
-    const lab = { hong: '채점', yak: '약술형', def: '정의', star: '★', new: '최신', pan: '판례', hak: '학설' };
-    let h = tags.filter(t => lab[t] && t !== 'pan' && t !== 'hak').map(t => `<span class="badge ${t}">${lab[t]}</span>`).join('');
+    const lab = { hong: '채점', yak: '약술형', def: '정의', star: '★', new: '최신' };
+    let h = tags.filter(t => lab[t]).map(t => `<span class="badge ${t}">${lab[t]}</span>`).join('');
     if (n.mn) h += `<span class="badge mn" title="두문자">${esc(n.mn)}</span>`;
     return h ? `<span class="badges deco">${h}</span>` : '';
   }
   function linkChips(n) {
     if (!n.ln) return '';
-    const crime = crimeOf(n), arts = crime.arts || [];
-    const short = a => a.replace(/^\(.*?\)/, '').replace(/죄$/, '').slice(0, 14);
-    const items = n.ln.slice(0, 4).map(([a, e]) => `<span class="chip" data-art="${a}" data-el="${e}">${esc(short(arts[a] || ''))} ${CIRC[e] || ''}</span>`);
-    if (n.ln.length > 4) items.push(`<span class="chip">+${n.ln.length - 4}</span>`);
+    const arts = (crimeOf(n) || {}).arts || [];
+    const short = a => { const s = a.replace(/^\(.*?\)/, '').replace(/죄$/, ''); return s.length > 13 ? s.slice(0, 12) + '…' : s; };
+    const items = n.ln.slice(0, 4).map(([a, e]) => `<span class="chip" title="${esc(arts[a] || '')} 요건 ${CIRC[e] || ''}">${esc(short(arts[a] || ''))} ${CIRC[e] || ''}</span>`);
+    if (n.ln.length > 4) items.push(`<span class="chip" title="${esc(n.ln.slice(4).map(([a, e]) => (arts[a] || '') + ' ' + (CIRC[e] || '')).join(', '))}">+${n.ln.length - 4}</span>`);
     return `<span class="chips deco">${items.join('')}</span>`;
   }
 
@@ -359,48 +422,41 @@
     const cls = ['card', 'k-' + n.k];
     if (n.lv) cls.push('lv-' + n.lv);
     if (n.box) cls.push('box');
+    if (isIssue(n)) cls.push('issue');
     if (S.sel === n.id) cls.push('sel');
     const conc = conceals(n);
     if (conc) cls.push('concealed');
     const st = n._card && cardState(n._card);
     if (st && st.l === 2) cls.push('g-ok'); else if (st && st.l === 0) cls.push('g-ng');
     let body;
-    if (n.k === 'tbl') body = `<span class="tx-wrap">${tableHTML(n)}</span>`;
+    if (conc && (n.k === 'tbl' || n.k === 'case')) body = `<span class="tx">${'　'.repeat(18)}</span>`;
+    else if (n.k === 'tbl') body = tableHTML(n);
     else if (n.k === 'case') body = caseHTML(n);
     else {
-      const long = T(n).length > 170 && !S.unclamp.has(n.id) && !conc;
-      if (long) cls.push('clamp');
-      const kind = n.k === 'el' ? `<span class="kind deco">${n.box ? '박스 요건' : n.issue ? '쟁점' : '구성요건'}</span>` : '';
+      const kind = n.k === 'el' ? `<span class="kind deco">${n.box ? '박스 요건' : isIssue(n) ? '쟁점' : '구성요건'}</span>` : '';
       const bul = n.k === 'p' && n.b ? `<span class="bul deco">${esc(n.b)}</span>` : '';
       const num = n.num ? `<span class="num deco">${esc(n.num)}</span>` : '';
-      body = kind + bul + num + txSpan(n, cardMarks(n)) + badgesHTML(n) + (n.k === 'el' ? linkChips(n) : '') +
-        (long ? `<button class="more deco">더보기</button>` : (T(n).length > 170 && S.unclamp.has(n.id) ? `<button class="more deco">접기</button>` : ''));
-      if (S.mode === 'hide' && n._card && (!conc) && revealedAll(n)) {
+      const showChips = n.k === 'el' && (S.mode !== 'cloze' || S.rev.has(n.id + ':h'));
+      body = kind + bul + num + txSpan(n, cardMarks(n)) + badgesHTML(n) + (showChips ? linkChips(n) : '');
+      if (S.mode === 'hide' && n._card && !conc && revealedAll(n)) {
         body += `<span class="grade deco"><button class="ok" data-g="2" data-card="${n._card}">✓ 알았음</button><button class="ng" data-g="0" data-card="${n._card}">✗ 몰랐음</button></span>`;
       }
     }
-    if ((n.k === 'tbl' || n.k === 'case') && conc) body = `<span class="tx">${'표 내용'.padEnd(18, ' ')}</span>`;
-    const tog = nk ? `<button class="kid-toggle deco" data-tog="${n.id}" aria-label="하위 ${nk}개 ${S.open.has(n.id) ? '접기' : '펼치기'}">${nk}</button>` : '';
+    const open = S.open.has(n.id);
+    const tog = nk ? `<button class="kid-toggle deco" data-tog="${n.id}" aria-expanded="${open}" aria-label="하위 ${nk}개 ${open ? '접기' : '펼치기'}">${open ? '−' : '+' + nk}</button>` : '';
     return `<div class="${cls.join(' ')}" data-id="${n.id}" data-hint="${conc ? esc(HINT(n)) + ' · 눌러서 보기' : ''}">${body}${tog}</div>`;
   }
-  function revealedAll(n) {
-    if (!n.ox) return S.rev.has(n.id);
-    if (n.ox.q) return S.rev.has(n.id + ':a');
-    return n.ox.v.every((_, i) => S.rev.has(`${n.id}:v${i}`));
-  }
 
-  function nodeHTML(n, br) {
+  function nodeHTML(n, br, depth) {
     const kids = kidsOf(n);
     const open = S.open.has(n.id);
-    let h = `<div class="mm-node br-${br}${kids.length && !open ? ' closed' : ''}" data-node="${n.id}">${cardHTML(n, kids.length)}`;
-    if (kids.length) h += `<div class="mm-kids">${open ? kids.map(k => nodeHTML(k, br)).join('') : ''}</div>`;
+    let h = `<div class="mm-node d${depth} br-${br}${kids.length && !open ? ' closed' : ''}" data-node="${n.id}">${cardHTML(n, kids.length)}`;
+    if (kids.length) h += `<div class="mm-kids">${open ? kids.map(k => nodeHTML(k, br, depth + 1)).join('') : ''}</div>`;
     return h + '</div>';
   }
 
   function rootCardHTML(c) {
-    const n = c.node;
-    const t = T(n);
-    const brk = [];
+    const n = c.node, t = T(n), brk = [];
     const m1 = /^\s*\[/.exec(t), m2 = /\]\s*$/.exec(t);
     if (m1) brk.push({ s: m1.index, e: m1.index + m1[0].length, cls: 'brk' });
     if (m2) brk.push({ s: m2.index, e: t.length, cls: 'brk' });
@@ -419,7 +475,7 @@
             marks.push({ s: p.art.ref[0], e: p.art.ref[1], cls: 'art-ref' });
             (p.art.els || []).forEach(([a, b], ei) => {
               const k = `${p.pid}:e${ei}`;
-              const hidden = (S.mode === 'hide' || S.mode === 'cloze') && !S.rev.has(k);
+              const hidden = S.mode !== 'study' && !S.rev.has(k);
               marks.push({ s: a, e: b, cls: (hidden ? (S.mode === 'hide' ? 'hide' : 'blank') : 'art-el') + ` ae-${ai}-${ei}`, key: k });
             });
             ai++;
@@ -443,33 +499,39 @@
   function renderMap() {
     const c = IDX.crimes[S.ci], n = c.node;
     const canvas = $('#mmCanvas');
-    document.body.classList.toggle('outline', S.outline);
     $('#mmViewport').classList.toggle('outline', S.outline);
     $('#layoutBtn').textContent = S.outline ? '맵' : '목록';
     canvas.style.setProperty('--z', S.z);
     $('#zoomVal').textContent = Math.round(S.z * 100) + '%';
-    const branches = kidsOf(n).filter(x => x.k !== 'stat');
-    let h = `<svg class="mm-wires" aria-hidden="true"></svg><div class="mm-node mm-root" data-node="${n.id}">${rootCardHTML(c)}`;
-    if (branches.length) h += `<div class="mm-kids">${branches.map((b, i) => nodeHTML(b, (i % 8) + 1)).join('')}</div>`;
+    const bs = branches();
+    const cols = S.single && !S.outline; // 한 요건씩(가로 맵): 구성요건 목록은 한 열에 모아 두고, 펼친 요건의 내용만 오른쪽 열에
+    let h = `<svg class="mm-wires" aria-hidden="true"></svg><div class="mm-node mm-root d0${cols ? ' cols' : ''}" data-node="${n.id}">${rootCardHTML(c)}`;
+    if (bs.length && cols) {
+      const ai = bs.findIndex(b => b.id === S.act && S.open.has(b.id));
+      h += `<div class="mm-kids mm-heads">${bs.map((b, i) => {
+        const nk = kidsOf(b).length;
+        return `<div class="mm-node d1 br-${(i % 8) + 1}${i === ai ? ' active' : ' closed'}" data-node="${b.id}">${cardHTML(b, nk)}</div>`;
+      }).join('')}</div>`;
+      if (ai >= 0) {
+        const act = bs[ai], br = (ai % 8) + 1;
+        h += `<div class="mm-kids mm-act br-${br}" data-act="${act.id}">${kidsOf(act).map(k => nodeHTML(k, br, 2)).join('')}</div>`;
+      }
+    } else if (bs.length) h += `<div class="mm-kids">${bs.map((b, i) => nodeHTML(b, (i % 8) + 1, 1)).join('')}</div>`;
     // 구분선·빈 문단은 학습 내용이 아니므로 숨긴 채로만 둔다(원문 글자는 그대로 보존)
     const quiet = [];
-    (function walk(x) { for (const ch of x.c || []) { if ((ch.k === 'sp' || ch.k === 'sep') && ch.pid) quiet.push(`<span class="tx" data-pid="${esc(ch.pid)}">${segsHTML(ch.s)}</span>`); walk(ch); } })(n);
+    (function walk(x) { for (const ch of x.c || []) { if ((ch.k === 'sp' || ch.k === 'sep') && ch.pid) quiet.push(`<span class="tx" data-pid="${esc(ch.pid)}">${segsHTML(dispSegs(ch))}</span>`); walk(ch); } })(n);
     canvas.innerHTML = h + '</div>' + (quiet.length ? `<div class="mm-quiet" hidden>${quiet.join('')}</div>` : '');
-    $$('.mm-viewport').forEach(v => v.classList.toggle('outline', S.outline));
+    syncToolbar();
     scheduleWires();
-    $$('#modeSeg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === S.mode)));
-    $$('#levelSeg button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.level === S.level)));
   }
 
-  // 한 노드만 다시 그린다(펼치기·공개 시 전체 재렌더 대신)
   function rerenderNode(id) {
-    const wrap = $(`.mm-node[data-node="${id}"]`);
+    const wrap = $(`#mmCanvas .mm-node[data-node="${id}"]`);
     const n = IDX.byId.get(id);
-    if (!wrap || !n) { renderMap(); return; }
-    if (wrap.classList.contains('mm-root')) { renderMap(); return; }
-    const br = +(/br-(\d+)/.exec(wrap.className) || [0, 1])[1];
+    if (!wrap || !n || wrap.classList.contains('mm-root') || wrap.parentElement.classList.contains('mm-heads')) { renderMap(); return; }
+    const br = +(/br-(\d+)/.exec(wrap.className) || [0, 1])[1], depth = +(/\bd(\d+)/.exec(wrap.className) || [0, 1])[1];
     const tmp = document.createElement('div');
-    tmp.innerHTML = nodeHTML(n, br);
+    tmp.innerHTML = nodeHTML(n, br, depth);
     wrap.replaceWith(tmp.firstElementChild);
     scheduleWires();
   }
@@ -484,6 +546,7 @@
     scheduleWires();
   }
 
+  // 가는 직각 연결선: 부모 → 짧은 가로선 → 세로 줄기 → 각 자식 첫 줄로 가로선
   let wireRAF = 0;
   function scheduleWires() { cancelAnimationFrame(wireRAF); wireRAF = requestAnimationFrame(drawWires); }
   function drawWires() {
@@ -492,49 +555,82 @@
     if (S.outline) { svg.innerHTML = ''; return; }
     const W = canvas.scrollWidth, H = canvas.scrollHeight;
     svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    const fs = parseFloat(getComputedStyle(canvas).fontSize) || 13;
     const rel = el => { let x = 0, y = 0; for (let e = el; e && e !== canvas; e = e.offsetParent) { x += e.offsetLeft; y += e.offsetTop; } return { x, y }; };
-    let d = '';
-    const byBr = {};
+    const anchor = card => Math.min(card.offsetHeight / 2, fs * 1.32);
+    const px = v => Math.round(v) + 0.5;
+    const paths = {};
+    const add = (cls, d) => { (paths[cls] = paths[cls] || []).push(d); };
+    const pairs = [];
     for (const wrap of canvas.querySelectorAll('.mm-node:not(.closed)')) {
-      const card = wrap.firstElementChild, kids = wrap.lastElementChild;
-      if (!kids || !kids.classList.contains('mm-kids') || !kids.firstElementChild) continue;
+      const kids = wrap.querySelector(':scope > .mm-kids:not(.mm-act)');
+      if (kids && kids.firstElementChild) pairs.push([wrap, wrap.firstElementChild, kids]);
+    }
+    const act = canvas.querySelector('.mm-act');
+    if (act && act.firstElementChild) {
+      const head = canvas.querySelector(`.mm-heads > .mm-node[data-node="${act.dataset.act}"]`);
+      if (head) pairs.push([head, head.firstElementChild, act]);
+    }
+    for (const [wrap, card, kids] of pairs) {
+      const isRoot = wrap.classList.contains('mm-root');
       const p = rel(card), tog = card.querySelector(':scope > .kid-toggle');
-      const x1 = p.x + (tog ? tog.offsetLeft + tog.offsetWidth : card.offsetWidth), y1 = p.y + card.offsetHeight / 2;
+      const x1 = p.x + (tog && tog.offsetParent ? tog.offsetLeft + tog.offsetWidth : card.offsetWidth);
+      const y1 = isRoot ? p.y + Math.min(card.offsetHeight / 2, fs * 1.6) : p.y + anchor(card);
+      const pts = [];
       for (const ch of kids.children) {
         const cc = ch.firstElementChild, q = rel(cc);
-        const x2 = q.x, y2 = q.y + cc.offsetHeight / 2, mx = x1 + Math.max(12, (x2 - x1) * 0.55);
-        const br = (/br-(\d+)/.exec(ch.className) || [0, 1])[1];
-        (byBr[br] = byBr[br] || []).push(`M${x1.toFixed(1)},${y1.toFixed(1)}C${mx.toFixed(1)},${y1.toFixed(1)} ${(x2 - (x2 - x1) * 0.35).toFixed(1)},${y2.toFixed(1)} ${x2.toFixed(1)},${y2.toFixed(1)}`);
+        pts.push({ x: q.x, y: q.y + anchor(cc), br: (/br-(\d+)/.exec(ch.className) || [0, 1])[1] });
+      }
+      const xs = px(x1 + Math.max(6, Math.min(fs * 1.4, (pts[0].x - x1) / 2)));
+      const top = Math.min(y1, pts[0].y), bot = Math.max(y1, pts[pts.length - 1].y);
+      if (isRoot) {
+        add('w-root', `M${px(x1)},${px(y1)}H${xs}M${xs},${px(top)}V${px(bot)}`);
+        for (const q of pts) add('w' + q.br, `M${xs},${px(q.y)}H${px(q.x)}`);
+      } else {
+        const br = (/br-(\d+)/.exec(wrap.className) || [0, 1])[1];
+        let d = `M${px(x1)},${px(y1)}H${xs}M${xs},${px(top)}V${px(bot)}`;
+        for (const q of pts) d += `M${xs},${px(q.y)}H${px(q.x)}`;
+        add('w' + br, d);
       }
     }
-    for (const br in byBr) d += `<path d="${byBr[br].join('')}" style="stroke:var(--b${br})"/>`;
-    svg.innerHTML = d;
+    svg.innerHTML = Object.entries(paths).map(([cls, ds]) => `<path class="${cls}" d="${ds.join('')}"/>`).join('');
   }
 
   function toggleNode(id, force) {
     const n = IDX.byId.get(id);
     if (!n || !kidsOf(n).length) return;
     const open = force != null ? force : !S.open.has(id);
+    const top = parentOf(n) && parentOf(n).k === 'crime';
+    if (open && top && S.single) {
+      // 한 요건씩: 다른 가지는 닫고 이 가지를 단계에 맞게 연다
+      for (const b of branches()) if (b !== n) { S.open.delete(b.id); subtreeIds(b).forEach(x => S.open.delete(x)); }
+      S.act = n.id;
+      openPerLevel(n, Math.max(S.level, 2));
+      renderMap();
+      requestAnimationFrame(() => { const c = $(`#mmCanvas .card[data-id="${id}"]`); if (c) scrollCardIntoView(c, true); });
+      return;
+    }
     if (open) S.open.add(id); else S.open.delete(id);
     rerenderNode(id);
+  }
+  function scrollCardIntoView(card, top) {
+    const vp = $('#mmViewport'), r = card.getBoundingClientRect(), v = vp.getBoundingClientRect();
+    if (top) vp.scrollTop += r.top - v.top - 12;
+    else if (r.top < v.top || r.bottom > v.bottom) vp.scrollTop += r.top - v.top - v.height / 3;
+    if (r.left < v.left || r.right > v.right) vp.scrollLeft += r.left - v.left - 40;
   }
   function select(id, scroll) {
     const prev = S.sel && $(`#mmCanvas .card[data-id="${S.sel}"]`);
     if (prev) prev.classList.remove('sel');
     S.sel = id;
     const card = $(`#mmCanvas .card[data-id="${id}"]`);
-    if (card) { card.classList.add('sel'); if (scroll) card.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' }); }
-  }
-  function revealNode(n) {
-    if (n.ox && n.ox.q) S.rev.add(n.id + ':a');
-    else if (n.ox) n.ox.v.forEach((_, i) => S.rev.add(`${n.id}:v${i}`));
-    S.rev.add(n.id);
+    if (card) { card.classList.add('sel'); if (scroll) scrollCardIntoView(card); }
   }
 
   function setZoom(z, anchor) {
     const vp = $('#mmViewport');
     const old = S.z;
-    S.z = clamp(Math.round(z * 100) / 100, 0.4, 1.8);
+    S.z = clamp(Math.round(z * 100) / 100, 0.5, 1.8);
     const ax = anchor ? anchor.x : vp.clientWidth / 2, ay = anchor ? anchor.y : vp.clientHeight / 2;
     const cx = (vp.scrollLeft + ax) / old, cy = (vp.scrollTop + ay) / old;
     $('#mmCanvas').style.setProperty('--z', S.z);
@@ -543,32 +639,32 @@
     scheduleWires();
     saveUI();
   }
-  function fit() {
+  function fit() { // 가로 폭에 맞춘다(세로는 스크롤)
     const vp = $('#mmViewport'), canvas = $('#mmCanvas');
-    const w = canvas.scrollWidth / S.z, h = canvas.scrollHeight / S.z;
-    setZoom(clamp(Math.min(vp.clientWidth / w, vp.clientHeight / h) * 0.98, 0.4, 1.2));
-    vp.scrollLeft = 0; vp.scrollTop = 0;
+    const w = canvas.scrollWidth / S.z;
+    setZoom(clamp((vp.clientWidth / w) * 0.98, 0.6, 1.2));
+    vp.scrollLeft = 0;
   }
 
   // 검색·덱에서 특정 노드로 이동
   function goToNode(n) {
     const ci = crimeIdxOf(n);
     if (ci < 0) return;
-    let target = n;
-    // 조문 박스 안 문단·표 셀 문단이면 그 노드 자체로
-    if (S.view !== 'map') setView('map');
-    if (ci !== S.ci) openCrime(ci, { keepView: true, target: true });
-    for (const a of ancestors(target)) if (a.k !== 'crime') S.open.add(a.id);
-    if (S.mode === 'hide') revealNode(target);
-    renderMap();
+    if (S.view !== 'map') { S.view = 'map'; $('#mmViewport').hidden = false; $('#overview').hidden = $('#quiz').hidden = $('#reader').hidden = true; }
+    if (ci !== S.ci) { S.ci = ci; markTOC(); S.rev.clear(); S.open.clear(); }
+    const top = topBranchOf(n);
+    if (S.single && top) { for (const b of branches()) if (b !== top) { S.open.delete(b.id); subtreeIds(b).forEach(x => S.open.delete(x)); } S.act = top.id; }
+    for (const a of ancestors(n)) if (a.k !== 'crime') S.open.add(a.id);
+    if (S.mode === 'hide') revealNode(n);
+    S.sel = n.id;
+    renderMap(); updateCrumb(); syncToolbar(); saveUI();
     requestAnimationFrame(() => {
-      let card = $(`#mmCanvas .card[data-id="${target.id}"]`) || $(`#mmCanvas [data-id="${target.id}"]`);
-      if (!card) for (const a of ancestors(target)) { card = $(`#mmCanvas .card[data-id="${a.id}"]`); if (card) break; }
+      let card = $(`#mmCanvas .card[data-id="${n.id}"]`) || $(`#mmCanvas [data-id="${n.id}"]`);
+      if (!card) for (const a of ancestors(n)) { card = $(`#mmCanvas .card[data-id="${a.id}"]`); if (card) break; }
       if (card) {
         const c = card.closest('.card') || card;
         c.scrollIntoView({ block: 'center', inline: 'center' });
         c.classList.add('flash');
-        if (c.dataset.id) select(c.dataset.id);
       }
     });
   }
@@ -580,10 +676,10 @@
     const collectFn = segs => (segs || []).forEach(s => { if (s.length === 3) fnUsed.push(s[2]); });
     let h = `<article><h2>${n.pid ? txSpan(n) : esc(n.name)}</h2><p class="rsub">${esc(c.chap ? c.chap.node.title || '' : '')}</p>`;
     collectFn(n.s);
-    const P = x => {
+    const para = x => {
       collectFn(x.s);
-      const lv = x.lv || 'g';
-      return `<div class="rp lv-${lv}${x.cont ? ' cont' : ''}">${x.b ? `<span class="bul deco">${esc(x.b)}</span>` : ''}${x.num ? `<span class="num deco">${esc(x.num)}</span>` : ''}<span>${txSpan(x, x.ox ? verdictMarks(x) : [])}${badgesHTML(x)}</span></div>`;
+      const lv = x.lv || 'g', conc = S.mode === 'hide' && !x.ox && !S.rev.has(x.id);
+      return `<div class="rp lv-${lv}${conc ? ' concealed' : ''}" data-id="${x.id}">${x.b ? `<span class="bul deco">${esc(x.b)}</span>` : ''}${x.num ? `<span class="num deco">${esc(x.num)}</span>` : ''}<span>${txSpan(x, cardMarks(x))}${badgesHTML(x)}</span></div>`;
     };
     const tblFn = t => t.cells.forEach(cell => cell.ps.forEach(p => p.tbl ? tblFn(p.tbl) : collectFn(p.s)));
     function walk(list) {
@@ -597,11 +693,11 @@
           out += `<div class="rstat">${x.cells.map(cell => cell.ps.map(p => p.tbl ? tableHTML(p.tbl) : `<p>${txSpan(p, p.art ? [{ s: p.art.name[0], e: p.art.name[1], cls: 'art-name' }] : [])}</p>`).join('')).join('')}</div>`;
           out += walk(x.c || []);
         } else if (x.k === 'el') { collectFn(x.s); out += `<h3>${txSpan(x)}</h3>` + walk(x.c || []); }
-        else if (x.k === 'p') out += P(x) + walk(x.c || []);
+        else if (x.k === 'p') out += para(x) + walk(x.c || []);
         else if (x.k === 'tbl') { tblFn(x); out += tableHTML(x); }
         else if (x.k === 'case') { tblFn(x); out += caseHTML(x); }
-        else if (x.k === 'sep') { collectFn(x.s); out += `<hr><span class="tx" data-pid="${esc(x.pid)}" hidden>${segsHTML(x.s)}</span>`; }
-        else if (x.k === 'sp') out += `<span class="tx" data-pid="${esc(x.pid)}" hidden>${segsHTML(x.s)}</span>`;
+        else if (x.k === 'sep') { collectFn(x.s); out += `<hr><span class="tx" data-pid="${esc(x.pid)}" hidden>${segsHTML(dispSegs(x))}</span>`; }
+        else if (x.k === 'sp') out += `<span class="tx" data-pid="${esc(x.pid)}" hidden>${segsHTML(dispSegs(x))}</span>`;
         else out += walk(x.c || []);
       }
       if (box) out += '</div>';
@@ -613,9 +709,10 @@
     }
     const prev = IDX.crimes[S.ci - 1], next = IDX.crimes[S.ci + 1];
     h += `<div class="nav">${prev ? `<button data-go="${S.ci - 1}">← ${esc(crimeName(prev.node))}</button>` : '<span></span>'}${next ? `<button data-go="${S.ci + 1}">${esc(crimeName(next.node))} →</button>` : ''}</div></article>`;
-    const r = $('#reader');
+    const r = $('#reader'), y = r.scrollTop;
     r.innerHTML = h;
-    r.scrollTop = 0;
+    r.scrollTop = renderReader.keep ? y : 0;
+    renderReader.keep = false;
   }
 
   // ───────────── 전체 지도 ─────────────
@@ -635,7 +732,9 @@
       }
       h += '</section>';
     }
-    $('#overview').innerHTML = h + '</div>';
+    const o = $('#overview'), y = o.scrollTop;
+    o.innerHTML = h + '</div>';
+    o.scrollTop = y;
   }
   function ovItem(x, ci, box, inner) {
     const conc = S.mode === 'hide' && !S.rev.has('ov:' + x.id);
@@ -643,21 +742,21 @@
   }
 
   // ───────────── 암기 카드 ─────────────
-  const DECKS = [['el', '구성요건 목록'], ['art', '조문 요건'], ['ox', '판례 O/X'], ['def', '정의'], ['yak', '약술형'], ['hong', '채점 노트'], ['all', '전부 섞기']];
+  const DECKS = [['el', '구성요건 목록'], ['law', '구성요건별 법리'], ['art', '조문 요건'], ['ox', '판례 O/X'], ['def', '정의'], ['yak', '약술형'], ['hong', '채점 노트'], ['all', '전부 섞기']];
   const Q = { deck: 'el', scope: 'crime', order: 'due', wrong: false, queue: [], i: 0, step: 0, answers: [], revealed: false, scopeCi: -1 };
-  function buildQueue() {
+  function scopePool() {
     const c = IDX.crimes[S.ci];
-    let pool = [];
-    if (Q.scope === 'crime') pool = c.cards;
-    else if (Q.scope === 'chap') pool = (c.chap ? c.chap.crimes : [c]).flatMap(x => x.cards);
-    else pool = IDX.crimes.flatMap(x => x.cards);
-    pool = pool.filter(k => Q.deck === 'all' || k.type === Q.deck);
+    if (Q.scope === 'crime') return c.cards;
+    if (Q.scope === 'chap') return (c.chap ? c.chap.crimes : [c]).flatMap(x => x.cards);
+    return IDX.crimes.flatMap(x => x.cards);
+  }
+  function buildQueue() {
+    let pool = scopePool().filter(k => Q.deck === 'all' || k.type === Q.deck);
     const now = Date.now();
     if (Q.wrong) pool = pool.filter(k => { const st = P.cards[k.id]; return st && st.l === 0; });
     if (Q.order === 'due') {
       const due = pool.filter(k => { const st = P.cards[k.id]; return !st || st.d <= now; });
-      pool = due.length ? due : pool;
-      pool = pool.slice().sort((a, b) => ((P.cards[a.id] || {}).b || 0) - ((P.cards[b.id] || {}).b || 0));
+      pool = (due.length ? due : pool).slice().sort((a, b) => ((P.cards[a.id] || {}).b || 0) - ((P.cards[b.id] || {}).b || 0));
     } else if (Q.order === 'rand') {
       pool = pool.slice();
       for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
@@ -665,20 +764,31 @@
     Q.queue = pool; Q.i = 0; resetCard();
   }
   function resetCard() { Q.step = 0; Q.answers = []; Q.revealed = false; }
+  function stepItems(k) { // 하나씩 공개하는 카드의 항목
+    if (k.type === 'el') {
+      const items = [];
+      for (const x of kidsOf(k.crime.node)) {
+        if (x.k !== 'el') continue;
+        items.push({ x, box: false });
+        for (const y of kidsOf(x)) if (y.k === 'el') items.push({ x: y, box: true });
+      }
+      return items;
+    }
+    if (k.type === 'law') return kidsOf(k.node).filter(x => x.k === 'p' && (x.lv === 'g' || x.lv === 'm')).map(x => ({ x }));
+    if (k.type === 'art') return k.para.art.els.map((e, i) => ({ i }));
+    return [];
+  }
   function renderQuiz(rebuild) {
     if (rebuild || Q.scopeCi !== S.ci) { Q.scopeCi = S.ci; buildQueue(); }
-    const counts = {};
-    const c = IDX.crimes[S.ci];
-    const scopePool = Q.scope === 'crime' ? c.cards : Q.scope === 'chap' ? (c.chap ? c.chap.crimes : [c]).flatMap(x => x.cards) : IDX.crimes.flatMap(x => x.cards);
-    for (const k of scopePool) counts[k.type] = (counts[k.type] || 0) + 1;
-    counts.all = scopePool.length;
-    const known = scopePool.filter(k => (P.cards[k.id] || {}).b >= 2).length;
+    const pool = scopePool(), counts = { all: pool.length };
+    for (const k of pool) counts[k.type] = (counts[k.type] || 0) + 1;
+    const known = pool.filter(k => (P.cards[k.id] || {}).b >= 2).length, learning = pool.filter(k => (P.cards[k.id] || {}).b === 1).length;
     let h = `<div class="qwrap"><div class="qctl">
       <select id="qDeck" aria-label="카드 종류">${DECKS.map(([k, l]) => `<option value="${k}"${Q.deck === k ? ' selected' : ''}>${l} (${counts[k] || 0})</option>`).join('')}</select>
       <select id="qScope" aria-label="범위"><option value="crime"${Q.scope === 'crime' ? ' selected' : ''}>이 죄</option><option value="chap"${Q.scope === 'chap' ? ' selected' : ''}>이 장</option><option value="all"${Q.scope === 'all' ? ' selected' : ''}>전체</option></select>
       <select id="qOrder" aria-label="순서"><option value="due"${Q.order === 'due' ? ' selected' : ''}>복습할 것 먼저</option><option value="seq"${Q.order === 'seq' ? ' selected' : ''}>원문 순서</option><option value="rand"${Q.order === 'rand' ? ' selected' : ''}>무작위</option></select>
       <label style="font-size:13px"><input type="checkbox" id="qWrong"${Q.wrong ? ' checked' : ''}> 틀린 것만</label>
-      <span class="qstat">${Q.queue.length ? `${Math.min(Q.i + 1, Q.queue.length)} / ${Q.queue.length}` : '0'} · 익힘 ${known}/${scopePool.length}</span></div>`;
+      <span class="qstat" title="익힘 = ‘알았음’을 두 번 이상 연속으로 고른 카드">${Q.queue.length ? `${Math.min(Q.i + 1, Q.queue.length)} / ${Q.queue.length}` : '0'} · 학습 중 ${learning} · 익힘 ${known}/${pool.length}</span></div>`;
     const card = Q.queue[Q.i];
     if (!card) h += `<div class="qcard"><div class="qempty">${Q.queue.length ? '이 묶음을 다 봤습니다. 범위나 순서를 바꿔 다시 시작하세요.' : '이 범위에는 해당 카드가 없습니다.'}</div><div class="row" style="justify-content:center"><button class="qbtn" id="qRestart">처음부터</button></div></div>`;
     else h += quizCardHTML(card);
@@ -688,81 +798,77 @@
     const parts = [];
     const crime = crimeOf(node);
     for (const a of ancestors(node).reverse()) {
-      if (a.k === 'el') parts.push(T(a).trim());
-      else if (a.k === 'p') parts.push(T(a).trim().slice(0, 30) + (T(a).trim().length > 30 ? '…' : ''));
+      if (a.k === 'el') parts.push(displayText(a).trim());
+      else if (a.k === 'p') { const t = displayText(a).trim(); parts.push(t.slice(0, 30) + (t.length > 30 ? '…' : '')); }
     }
     return [crime ? crimeName(crime) : '', ...parts].filter(Boolean).map(esc).join(' › ');
   }
+  const gradeRow = (n, def) => `<div class="row">${[[0, '몰랐음'], [1, '헷갈림'], [2, '알았음']].map(([g, l]) => `<button class="qbtn${g === def ? ' primary' : ''}" data-qg="${g}">${l}<kbd>${g + 1}</kbd></button>`).join('')}<button class="qbtn" data-qmap="${n.id}">맵에서 보기</button></div>`;
+  function slotList(items, render, cls) {
+    let list = '', subOpen = false;
+    items.forEach((it, i) => {
+      const shown = i < Q.step || Q.revealed;
+      const li = `<li class="${shown ? '' : 'concealed'}" data-slot="${i}">${render(it)}`;
+      if (it.box) { if (!subOpen) { list += '<ul>'; subOpen = true; } list += li + '</li>'; return; }
+      if (subOpen) { list += '</ul>'; subOpen = false; }
+      if (i) list += '</li>';
+      list += li;
+    });
+    if (subOpen) list += '</ul>';
+    return `<ol class="qlist ${cls || ''}">${list}${items.length ? '</li>' : ''}</ol>`;
+  }
   function quizCardHTML(k) {
     const n = k.node, t = T(n);
-    const grade3 = `<div class="row"><button class="qbtn" data-qg="0">몰랐음<kbd>1</kbd></button><button class="qbtn" data-qg="1">헷갈림<kbd>2</kbd></button><button class="qbtn primary" data-qg="2">알았음<kbd>3</kbd></button><button class="qbtn" data-qmap="${n.id}">맵에서 보기</button></div>`;
-    const revealBtn = `<div class="row"><button class="qbtn primary" id="qReveal">답 보기<kbd>Space</kbd></button></div>`;
+    const revealBtn = label => `<div class="row"><button class="qbtn primary" id="qReveal">${label || '답 보기'}<kbd>Space</kbd></button></div>`;
+    const stepBtns = label => `<div class="row"><button class="qbtn primary" id="qStep">${label}<kbd>Space</kbd></button><button class="qbtn" id="qReveal">모두 보기</button></div>`;
     let h = `<div class="qcard" data-card="${k.id}">`;
     if (k.type === 'el') {
-      const items = [];
-      for (const x of kidsOf(k.crime.node)) {
-        if (x.k !== 'el') continue;
-        items.push({ x, box: false });
-        for (const y of kidsOf(x)) if (y.k === 'el') items.push({ x: y, box: true });
-      }
+      const items = stepItems(k);
       const arts = (k.crime.node.arts || []).join(' · ');
       h += `<div class="ctx">${esc(k.crime.chap ? k.crime.chap.node.title || '' : '')}</div><div class="prompt display">${esc(crimeName(k.crime.node))}의 구성요건을 순서대로 떠올려 보세요</div>${arts ? `<div class="ctx">조문: ${esc(arts)}</div>` : ''}`;
-      const slot = (it, i) => i < Q.step || Q.revealed ? txSpan(it.x) : `<span class="mk hide" style="display:inline-block;min-width:${Math.min(16, T(it.x).trim().length * .9 + 2)}em">&nbsp;</span>`;
-      let list = '', subOpen = false;
-      items.forEach((it, i) => {
-        if (it.box) { if (!subOpen) { list += '<ul>'; subOpen = true; } list += `<li>${slot(it, i)}</li>`; return; }
-        if (subOpen) { list += '</ul>'; subOpen = false; }
-        if (i) list += '</li>';
-        list += `<li>${slot(it, i)}`;
-      });
-      if (subOpen) list += '</ul>';
-      h += `<ol class="qlist">${list}${items.length ? '</li>' : ''}</ol>`;
-      if (Q.revealed || Q.step >= items.length) h += grade3;
-      else h += `<div class="row"><button class="qbtn primary" id="qStep">하나씩 보기<kbd>Space</kbd></button><button class="qbtn" id="qReveal">모두 보기</button></div>`;
+      h += slotList(items, it => txSpan(it.x));
+      h += Q.revealed || Q.step >= items.length ? gradeRow(n, 2) : stepBtns('하나씩 보기');
+    } else if (k.type === 'law') {
+      const items = stepItems(k);
+      h += `<div class="ctx">${esc(crimeName(k.crime.node))} · 법리 ${items.length}개</div><div class="prompt display">${txSpan(n)}</div><div class="ctx">이 구성요건의 법리를 떠올려 보세요</div>`;
+      h += slotList(items, it => txSpan(it.x, it.x.ox ? verdictMarks(it.x) : []), 'laws');
+      h += Q.revealed || Q.step >= items.length ? gradeRow(n, 2) : stepBtns('하나씩 보기');
     } else if (k.type === 'art') {
       const p = k.para, els = p.art.els;
-      const marks = [{ s: p.art.name[0], e: p.art.name[1], cls: 'art-name' }].concat(els.map(([a, b], i) => ({ s: a, e: b, cls: i < Q.step || Q.revealed ? 'shown' : 'hide' })));
+      const marks = [{ s: p.art.name[0], e: p.art.name[1], cls: 'art-name' }].concat(els.map(([a, b], i) => ({ s: a, e: b, cls: i < Q.step || Q.revealed ? 'shown' : 'hide', key: 'q' + i })));
       h += `<div class="ctx">${esc(crimeName(k.crime.node))} · 조문 요건 ${els.length}개</div><div class="prompt" style="font-family:var(--f-display)">${txSpan(p, marks)}</div>`;
-      if (Q.revealed || Q.step >= els.length) h += grade3;
-      else h += `<div class="row"><button class="qbtn primary" id="qStep">요건 하나씩<kbd>Space</kbd></button><button class="qbtn" id="qReveal">모두 보기</button></div>`;
+      h += Q.revealed || Q.step >= els.length ? gradeRow(n, 2) : stepBtns('요건 하나씩');
     } else if (k.type === 'ox') {
-      const ox = n.ox, need = ox.v.length;
-      const done = Q.answers.length >= need;
-      let marks;
+      const ox = n.ox, need = ox.v.length, done = Q.answers.length >= need;
+      const right = done && ox.v.every((v, i) => t[v] === Q.answers[i]);
+      const res = done ? `<span class="qres ${right ? 'ok' : 'ng'}">${right ? '정답' : '오답'} — 내 답: ${Q.answers.join(' · ')}</span><br>` : '';
+      const ask = `<div class="row"><button class="qbtn o" data-ox="O">O<kbd>O</kbd></button><button class="qbtn x" data-ox="X">X<kbd>X</kbd></button><span class="qstat" style="align-self:center">판정 ${Q.answers.length + 1}/${need}</span></div>`;
+      const ds = dispSegs(n);
+      h += `<div class="ctx">${ctxOf(n)}</div>`;
       if (ox.q) {
-        h += `<div class="ctx">${ctxOf(n)}</div><div class="prompt">${segsHTML(sliceSegs(n.s, 0, ox.q[1]))}</div>`;
-        if (done) {
-          const right = ox.v.every((v, i) => t[v] === Q.answers[i]);
-          marks = ox.v.map((v, i) => ({ s: v, e: v + 1, cls: 'v-' + t[v] }));
-          h += `<div class="answer"><span class="qres ${right ? 'ok' : 'ng'}">${right ? '정답' : '오답'} — 내 답: ${Q.answers.join(' · ')}</span><br>${txSpan(n, marks)}</div>` + grade3.replace('data-qg="2"', right ? 'data-qg="2" autofocus' : 'data-qg="2"');
-        } else {
-          const blanks = ox.v.map((v, i) => ({ s: v, e: v + 1, cls: i < Q.answers.length ? 'v-' + Q.answers[i] : 'hide' }));
-          h += `<div class="answer">${segsHTML(sliceSegs(n.s, ox.a[0], t.length), blanks.map(b => ({ ...b, s: b.s - ox.a[0], e: b.e - ox.a[0] })))}</div>`;
-          h += `<div class="row"><button class="qbtn o" data-ox="O">O<kbd>O</kbd></button><button class="qbtn x" data-ox="X">X<kbd>X</kbd></button><span class="qstat" style="align-self:center">판정 ${Q.answers.length + 1}/${need}</span></div>`;
-        }
+        h += `<div class="prompt">${segsHTML(sliceSegs(ds, 0, ox.q[1]))}</div>`;
+        const shift = m => ({ ...m, s: m.s - ox.a[0], e: m.e - ox.a[0] });
+        const marks = ox.v.map((v, i) => ({ s: v, e: v + 1, cls: done ? 'v-' + t[v] : (i < Q.answers.length ? 'v-' + Q.answers[i] : 'hide vd') })).map(shift);
+        h += `<div class="answer">${res}${segsHTML(sliceSegs(ds, ox.a[0], t.length), marks)}</div>`;
       } else {
-        h += `<div class="ctx">${ctxOf(n)}</div>`;
-        if (done) {
-          const right = ox.v.every((v, i) => t[v] === Q.answers[i]);
-          h += `<div class="prompt">${txSpan(n, verdictMarks(n))}</div><div class="answer"><span class="qres ${right ? 'ok' : 'ng'}">${right ? '정답' : '오답'} — 내 답: ${Q.answers.join(' · ')}</span></div>` + grade3;
-        } else {
-          marks = ox.v.map((v, i) => ({ s: v, e: v + 1, cls: i < Q.answers.length ? 'v-' + Q.answers[i] : 'hide' }));
-          h += `<div class="prompt">${txSpan(n, marks)}</div><div class="row"><button class="qbtn o" data-ox="O">O<kbd>O</kbd></button><button class="qbtn x" data-ox="X">X<kbd>X</kbd></button><span class="qstat" style="align-self:center">판정 ${Q.answers.length + 1}/${need}</span></div>`;
-        }
+        const marks = ox.v.map((v, i) => ({ s: v, e: v + 1, cls: done ? 'v-' + t[v] : (i < Q.answers.length ? 'v-' + Q.answers[i] : 'hide vd') }));
+        h += `<div class="prompt">${txSpan(n, marks)}</div>${done ? `<div class="answer">${res}</div>` : ''}`;
       }
+      h += done ? gradeRow(n, right ? 2 : 0) : ask;
     } else if (k.type === 'def') {
       h += `<div class="ctx">${ctxOf(n)}</div><div class="prompt display">‘${esc(n.term || '')}’의 정의는?${n.mn ? ` <span class="badge mn">${esc(n.mn)}</span>` : ''}</div>`;
-      h += Q.revealed ? `<div class="answer">${txSpan(n)}</div>` + grade3 : revealBtn;
+      h += Q.revealed ? `<div class="answer">${txSpan(n)}</div>` + gradeRow(n, 2) : revealBtn();
     } else if (k.type === 'yak') {
       h += `<div class="ctx">${ctxOf(n)}</div><div class="prompt">${txSpan(n)}</div>`;
       if (Q.revealed) {
         const anchor = ancestors(n).find(a => a.k === 'el') || parentOf(n);
-        h += `<div class="answer"><div class="ref">${refHTML(anchor, 0, n.id)}</div></div>` + grade3;
-      } else h += revealBtn.replace('답 보기', '관련 법리 보기');
+        h += `<div class="answer"><div class="ref">${refHTML(anchor, 0, n.id)}</div></div>` + gradeRow(n, 2);
+      } else h += revealBtn('관련 법리 보기');
     } else if (k.type === 'hong') {
       const par = parentOf(n);
-      h += `<div class="ctx">${ctxOf(n)}</div><div class="prompt">${par && par.k !== 'crime' ? `<span style="color:var(--ink-3)">이 부분의 채점 포인트는?</span>\n${segsHTML(par.s || [])}` : '이 부분의 채점 포인트는?'}</div>`;
-      h += Q.revealed ? `<div class="answer">${txSpan(n)}</div>` + grade3 : revealBtn;
+      const usePar = par && par.k !== 'crime' && par.s;
+      h += `<div class="ctx">${ctxOf(usePar ? par : n)}</div><div class="prompt">${usePar ? `<span style="color:var(--ink-3)">이 부분의 채점 포인트는?</span>\n${segsHTML(dispSegs(par))}` : '이 부분의 채점 포인트는?'}</div>`;
+      h += Q.revealed ? `<div class="answer">${txSpan(n)}</div>` + gradeRow(n, 2) : revealBtn();
     }
     return h + '</div>';
   }
@@ -779,29 +885,31 @@
   function refHTML(n, depth, skip) {
     if (!n || depth > 3) return '';
     const lines = [];
-    if (n.s && n.id !== skip) lines.push(`<div style="padding-left:${depth * 1.1}em;margin:2px 0">${n.b ? `<span class="bul">${esc(n.b)}</span> ` : ''}${segsHTML(n.s, n.ox ? verdictMarks(n) : [])}</div>`);
+    if (n.s && n.id !== skip) lines.push(`<div style="padding-left:${depth * 1.1}em;margin:2px 0">${n.b ? `<span class="bul">${esc(n.b)}</span> ` : ''}${segsHTML(dispSegs(n), n.ox ? verdictMarks(n) : [])}</div>`);
     for (const ch of kidsOf(n)) if (ch.k === 'p' || ch.k === 'el') lines.push(refHTML(ch, depth + 1, skip));
     return lines.join('');
   }
   function quizNext(g) {
     const card = Q.queue[Q.i];
-    if (card && g != null) grade(card.id, g);
+    if (card && g != null) {
+      const st = grade(card.id, g);
+      if (g === 0 && Q.queue.indexOf(card, Q.i + 1) < 0) Q.queue.push(card); // 몰랐던 카드는 이번 묶음 끝에 다시
+      toast(g === 0 ? '이번 묶음 끝에 다시 나옵니다' : g === 1 ? '내일 다시 복습' : `다음 복습: ${BOX_DAYS[st.b] || 1}일 뒤`);
+    }
     Q.i++; resetCard(); renderQuiz();
   }
   function quizAdvance() {
     const card = Q.queue[Q.i];
     if (!card) return;
-    if (card.type === 'el' || card.type === 'art') {
-      const total = card.type === 'art' ? card.para.art.els.length : $$('#quiz .qlist li').length;
-      if (Q.step < total && !Q.revealed) Q.step++; else Q.revealed = true;
-    } else Q.revealed = true;
+    const total = stepItems(card).length;
+    if (total && Q.step < total - 1 && !Q.revealed) Q.step++; else Q.revealed = true;
     renderQuiz();
   }
 
   // ───────────── 검색 ─────────────
   function buildSearch() {
     const items = [];
-    const add = (p, node) => { const t = T(p); if (!t.trim()) return; const n = normText(t); items.push({ p, node, t, n, ch: chosung(n) }); };
+    const add = (p, node) => { const t = T(p); if (!t.trim()) return; const n = normText(t); items.push({ p, node, t: displayText(p), n, ch: chosung(n) }); };
     (function walk(x) {
       if (x.s && x.pid && x.k !== 'sp' && x.k !== 'sep') add(x, x);
       if (x.cells) (function cells(cl, owner) { for (const c of cl) for (const p of c.ps) p.tbl ? cells(p.tbl.cells, owner) : add(p, owner); })(x.cells, x);
@@ -817,8 +925,7 @@
     const nq = normText(q), isCho = /^[ㄱ-ㅎ]+$/.test(nq);
     const res = [];
     for (const it of IDX.search) {
-      const i = isCho ? it.ch.indexOf(nq) : it.n.indexOf(nq);
-      if (i >= 0) { res.push(it); if (res.length >= 80) break; }
+      if ((isCho ? it.ch : it.n).indexOf(nq) >= 0) { res.push(it); if (res.length >= 80) break; }
     }
     const re = isCho ? null : new RegExp(Array.from(nq, c => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*'));
     box.innerHTML = res.length ? res.map((it, k) => {
@@ -838,7 +945,7 @@
     closePop();
     const k = el.dataset.fn, ps = FN[k] || [];
     const pop = document.createElement('div');
-    pop.className = 'pop'; pop.id = 'pop';
+    pop.className = 'pop'; pop.id = 'pop'; pop.setAttribute('role', 'dialog'); pop.setAttribute('aria-label', '각주 ' + k);
     pop.innerHTML = `<div class="fnno">각주 ${esc(k)}</div>${ps.map(p => p.tbl ? tableHTML(p.tbl) : `<p>${txSpan(p)}</p>`).join('')}`;
     document.body.appendChild(pop);
     const r = el.getBoundingClientRect();
@@ -854,20 +961,22 @@
     d.innerHTML = `<div class="box" role="dialog" aria-modal="true">${html}<div class="row"><button class="qbtn" data-close>닫기</button></div></div>`;
     d.addEventListener('click', e => { if (e.target === d || e.target.closest('[data-close]')) closeDialog(); });
     document.body.appendChild(d);
+    const btn = d.querySelector('[data-close]'); if (btn) btn.focus();
     return d;
   }
   function closeDialog() { const d = $('#dlg'); if (d) d.remove(); }
   function showHelp() {
-    const rows = [['/', '검색'], ['1 · 2 · 3', '펼치기 단계 (구성요건 / +법리 / 전부)'], ['S · H · C', '보기 / 가리기 / 빈칸'], ['← → ↑ ↓', '맵에서 이동 · 펼치기 · 접기'], ['Space · Enter', '가린 카드 보기 · 펼치기'],
-      ['F', '화면에 맞추기'], ['+ / −', '확대 / 축소 (Ctrl+휠도 가능)'], ['L', '가로 맵 ↔ 세로 목록'], ['[ · ]', '이전 죄 / 다음 죄'], ['M · O · Q · R', '마인드맵 / 전체 지도 / 암기 카드 / 원문'],
+    const rows = [['/', '검색'], ['1 · 2 · 3', '펼치기 단계 (구성요건 / +법리 / 전부)'], ['G', '한 요건씩 켜기·끄기'], ['S · H · C', '보기 / 가리기 / 빈칸'], ['U', '공개한 것 모두 다시 가리기'],
+      ['← → ↑ ↓', '맵에서 이동 · 펼치기 · 접기'], ['Space · Enter', '가린 것 보기 · 펼치기'],
+      ['F', '가로 폭에 맞추기'], ['+ / −', '확대 / 축소 (Ctrl+휠도 가능)'], ['L', '가로 맵 ↔ 세로 목록'], ['[ · ]', '이전 죄 / 다음 죄'], ['M · O · Q · R', '마인드맵 / 전체 지도 / 암기 카드 / 원문'],
       ['카드에서 O · X', '판례 판정 답하기'], ['카드에서 1 · 2 · 3', '몰랐음 / 헷갈림 / 알았음'], ['Esc', '팝업 닫기']];
     dialog(`<h2>단축키</h2><table>${rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('')}</table>`);
   }
   function showInfo() {
     const cards = IDX.crimes.reduce((a, c) => a + c.cards.length, 0);
     const known = Object.values(P.cards).filter(s => s.b >= 2).length;
-    const cover = (D.meta.cover || []).map(p => p.tbl ? '' : `<p>${segsHTML(p.s)}</p>`).join('');
-    const fn1 = FN['1'] ? FN['1'].map(p => p.tbl ? '' : `<p style="color:var(--ink-3);font-size:12.5px">${segsHTML(p.s)}</p>`).join('') : '';
+    const cover = (D.meta.cover || []).map(p => p.tbl ? '' : `<p>${segsHTML(dispSegs(p))}</p>`).join('');
+    const fn1 = FN['1'] ? FN['1'].map(p => p.tbl ? '' : `<p style="color:var(--ink-3);font-size:12.5px">${segsHTML(dispSegs(p))}</p>`).join('') : '';
     const d = dialog(`<h2>자료 정보</h2><div class="cover">${cover}${fn1}</div>
       <p style="font-size:13.5px">죄 ${IDX.crimes.length}개 · 암기 카드 ${cards}장 · 익힘 ${known}장</p>
       <p style="font-size:12.5px;color:var(--ink-3)">진도는 이 브라우저에만 저장됩니다. 다른 기기로 옮기거나 지우기 전에 백업하세요.</p>
@@ -895,15 +1004,35 @@
   }
 
   // ───────────── 입력 ─────────────
+  function setMode(m) {
+    S.mode = m; S.rev.clear();
+    if (S.view === 'map') renderMap(); else if (S.view === 'overview') renderOverview(); else if (S.view === 'read') renderReader();
+    syncToolbar();
+    saveUI();
+  }
+  function recover() {
+    S.rev.clear();
+    if (S.view === 'map') renderMap(); else if (S.view === 'overview') renderOverview(); else if (S.view === 'read') renderReader();
+    toast('다시 가렸습니다');
+  }
+  function setLevel(l) { S.level = l; presetOpen(l); renderMap(); saveUI(); }
+  function setSingle(on) { S.single = on; presetOpen(S.level); renderMap(); saveUI(); }
+
+  let dragMoved = false;
   function bindUI() {
     $$('.views button').forEach(b => b.onclick = () => setView(b.dataset.view));
-    $('#toc').addEventListener('click', e => { const b = e.target.closest('[data-ci]'); if (b) { if (S.view === 'overview') S.view = 'map'; openCrime(+b.dataset.ci); if (S.view === 'map') setView('map'); } });
+    $('#toc').addEventListener('click', e => {
+      const b = e.target.closest('[data-ci]'); if (!b) return;
+      if (S.view === 'overview') { S.ci = +b.dataset.ci; setView('map'); } else openCrime(+b.dataset.ci);
+    });
     $('#menuBtn').onclick = () => $('#side').classList.toggle('open');
     $('#helpBtn').onclick = showHelp;
     $('#infoBtn').onclick = showInfo;
     $('#themeBtn').onclick = cycleTheme;
     $$('#modeSeg button').forEach(b => b.onclick = () => setMode(b.dataset.mode));
     $$('#levelSeg button').forEach(b => b.onclick = () => setLevel(+b.dataset.level));
+    $('#singleBtn').onclick = () => setSingle(!S.single);
+    $('#recover').onclick = recover;
     $('#zoomIn').onclick = () => setZoom(S.z + 0.1);
     $('#zoomOut').onclick = () => setZoom(S.z - 0.1);
     $('#zoomFit').onclick = fit;
@@ -922,6 +1051,7 @@
       const b = e.target.closest('[data-hit]'); if (!b) return;
       const it = $('#results')._res[+b.dataset.hit];
       $('#results').hidden = true;
+      $('#side').classList.remove('open');
       goToNode(it.node);
     });
     document.addEventListener('click', e => {
@@ -930,18 +1060,16 @@
       const fn = e.target.closest('sup.fn');
       if (fn) { e.stopPropagation(); showFootnote(fn); }
     }, true);
+    document.addEventListener('keydown', e => { if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('sup.fn')) { e.preventDefault(); showFootnote(e.target); } });
 
     // 맵 클릭
     const canvas = $('#mmCanvas');
     canvas.addEventListener('click', e => {
-      if (e.target.closest('sup.fn')) return;
-      if (dragMoved) return;
+      if (e.target.closest('sup.fn') || dragMoved) return;
       const g = e.target.closest('[data-g]');
-      if (g) { grade(g.dataset.card, +g.dataset.g); rerenderCard(g.closest('.card').dataset.id); return; }
+      if (g) { const st = grade(g.dataset.card, +g.dataset.g); toast(+g.dataset.g === 0 ? '몰랐음으로 기록' : `다음 복습: ${BOX_DAYS[st.b] || 1}일 뒤`); rerenderCard(g.closest('.card').dataset.id); return; }
       const tog = e.target.closest('[data-tog]');
       if (tog) { toggleNode(tog.dataset.tog); return; }
-      const more = e.target.closest('.more');
-      if (more) { const id = more.closest('.card').dataset.id; S.unclamp.has(id) ? S.unclamp.delete(id) : S.unclamp.add(id); rerenderCard(id); return; }
       const mk = e.target.closest('.mk.hide, .mk.blank');
       if (mk && mk.dataset.k) {
         S.rev.add(mk.dataset.k);
@@ -961,11 +1089,11 @@
       if (kidsOf(n).length) toggleNode(id);
     });
     canvas.addEventListener('mouseover', e => {
-      const chip = e.target.closest('.k-el');
+      const head = e.target.closest('.k-el');
       const ae = e.target.closest('.art-el');
       $$('#mmCanvas .hl').forEach(x => x.classList.remove('hl'));
-      if (chip) {
-        const n = IDX.byId.get(chip.dataset.id);
+      if (head) {
+        const n = IDX.byId.get(head.dataset.id);
         (n && n.ln || []).forEach(([a, el]) => $$(`#mmCanvas .ae-${a}-${el}`).forEach(x => x.classList.add('hl')));
       } else if (ae) {
         const m = /ae-(\d+)-(\d+)/.exec(ae.className);
@@ -973,9 +1101,9 @@
       }
     });
 
-    // 끌어서 이동 · Ctrl+휠 확대
+    // 끌어서 이동 · Ctrl+휠 확대 · 스크롤 시 연결선(고정된 제목) 갱신
     const vp = $('#mmViewport');
-    let drag = null, dragMoved = false;
+    let drag = null;
     vp.addEventListener('pointerdown', e => {
       if (e.button !== 0 || e.target.closest('.card') || S.outline) return;
       drag = { x: e.clientX, y: e.clientY, sl: vp.scrollLeft, st: vp.scrollTop, id: e.pointerId }; dragMoved = false;
@@ -995,11 +1123,18 @@
       const r = vp.getBoundingClientRect();
       setZoom(S.z * (e.deltaY < 0 ? 1.08 : 1 / 1.08), { x: e.clientX - r.left, y: e.clientY - r.top });
     }, { passive: false });
+    vp.addEventListener('scroll', scheduleWires, { passive: true });
     new ResizeObserver(scheduleWires).observe(canvas);
     if (document.fonts && document.fonts.ready) document.fonts.ready.then(scheduleWires);
 
     // 원문 · 지도 · 카드
-    $('#reader').addEventListener('click', e => { const b = e.target.closest('[data-go]'); if (b) openCrime(+b.dataset.go, { keepView: true }); });
+    $('#reader').addEventListener('click', e => {
+      const b = e.target.closest('[data-go]'); if (b) { openCrime(+b.dataset.go); return; }
+      const mk = e.target.closest('.mk.hide, .mk.blank');
+      if (mk && mk.dataset.k) { S.rev.add(mk.dataset.k); renderReader.keep = true; renderReader(); return; }
+      const rp = e.target.closest('.rp.concealed');
+      if (rp) { S.rev.add(rp.dataset.id); renderReader.keep = true; renderReader(); }
+    });
     $('#overview').addEventListener('click', e => {
       const li = e.target.closest('[data-ov]');
       if (li) {
@@ -1007,7 +1142,7 @@
         goToNode(IDX.byId.get(li.dataset.ov)); return;
       }
       const b = e.target.closest('[data-ci]');
-      if (b) { S.view = 'map'; S.ci = +b.dataset.ci; setView('map'); }
+      if (b) { S.ci = +b.dataset.ci; setView('map'); }
     });
     $('#quiz').addEventListener('change', e => {
       if (e.target.id === 'qDeck') Q.deck = e.target.value;
@@ -1017,6 +1152,7 @@
       renderQuiz(true);
     });
     $('#quiz').addEventListener('click', e => {
+      if (e.target.closest('.qcard li.concealed, .qcard .mk.hide') && !e.target.closest('button')) { quizAdvance(); return; }
       const t = e.target.closest('button'); if (!t) return;
       if (t.id === 'qRestart') { renderQuiz(true); return; }
       if (t.id === 'qReveal') { Q.revealed = true; renderQuiz(); return; }
@@ -1030,36 +1166,31 @@
     addEventListener('resize', scheduleWires);
   }
 
-  function setMode(m) {
-    S.mode = m; S.rev.clear();
-    $$('#modeSeg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === m)));
-    if (S.view === 'map') renderMap(); else if (S.view === 'overview') renderOverview();
-    saveUI();
-  }
-  function setLevel(l) { S.level = l; presetOpen(l); renderMap(); saveUI(); }
-
   function visibleCards() { return $$('#mmCanvas .card').filter(c => c.offsetParent !== null); }
   function onKey(e) {
     if (e.target.closest && e.target.closest('input, select, textarea')) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     const k = e.key;
-    if (k === 'Escape') { closePop(); closeDialog(); $('#results').hidden = true; return; }
+    if (k === 'Escape') { closePop(); closeDialog(); $('#results').hidden = true; $('#side').classList.remove('open'); return; }
     if ($('#dlg')) return;
     if (k === '/') { e.preventDefault(); $('#side').classList.add('open'); $('#q').focus(); return; }
     if (k === '?') { showHelp(); return; }
-    if (k === '[' || k === ']') { openCrime(S.ci + (k === ']' ? 1 : -1), { keepView: true }); if (S.view === 'map') setView('map'); return; }
+    if (k === '[' || k === ']') { openCrime(S.ci + (k === ']' ? 1 : -1)); return; }
     if (S.view === 'quiz') return quizKey(e);
+    // 포커스된 버튼은 브라우저 기본 동작(클릭)을 그대로 쓴다
+    if ((k === ' ' || k === 'Enter') && e.target.closest && e.target.closest('button')) return;
     const lower = k.toLowerCase();
     if (lower === 'm') return setView('map');
     if (lower === 'o') return setView('overview');
     if (lower === 'q') return setView('quiz');
     if (lower === 'r') return setView('read');
-    if (S.view !== 'map' && S.view !== 'overview') return;
     if (lower === 's') return setMode('study');
     if (lower === 'h') return setMode('hide');
-    if (lower === 'c') return setMode('cloze');
+    if (lower === 'c' && S.view !== 'overview') return setMode('cloze');
+    if (lower === 'u') return recover();
     if (S.view !== 'map') return;
     if (k === '1' || k === '2' || k === '3') return setLevel(+k);
+    if (lower === 'g') return setSingle(!S.single);
     if (lower === 'f') return fit();
     if (lower === 'l') { S.outline = !S.outline; saveUI(); renderMap(); return; }
     if (k === '+' || k === '=') return setZoom(S.z + 0.1);
@@ -1069,8 +1200,14 @@
     let cur = S.sel && $(`#mmCanvas .card[data-id="${S.sel}"]`);
     if (!cur || cur.offsetParent === null) cur = null;
     const n = cur && IDX.byId.get(cur.dataset.id);
+    const isTop = n && parentOf(n) && parentOf(n).k === 'crime';
     if (k === 'ArrowDown' || k === 'ArrowUp') {
       e.preventDefault();
+      if (isTop && S.single && S.level >= 2) { // 한 요건씩: 다음/이전 구성요건으로 넘어가며 펼친다
+        const bs = branches(), i = bs.indexOf(n), nx = bs[clamp(i + (k === 'ArrowDown' ? 1 : -1), 0, bs.length - 1)];
+        if (nx && nx !== n) { S.sel = nx.id; if (kidsOf(nx).length) toggleNode(nx.id, true); else { renderMap(); select(nx.id, true); } }
+        return;
+      }
       const i = cur ? cards.indexOf(cur) : -1;
       const nx = cards[clamp(i + (k === 'ArrowDown' ? 1 : -1), 0, cards.length - 1)];
       select(nx.dataset.id, true);
@@ -1099,20 +1236,21 @@
     const k = e.key.toLowerCase();
     const card = Q.queue[Q.i];
     if (!card) return;
+    if ((k === ' ' || k === 'enter') && e.target.closest && e.target.closest('#quiz button')) return; // 포커스된 버튼은 그 버튼대로
     const gradeVisible = !!$('#quiz [data-qg]');
     if (gradeVisible && (k === '1' || k === '2' || k === '3')) { e.preventDefault(); quizNext(+k - 1); return; }
     if (card.type === 'ox' && (k === 'o' || k === 'x') && !gradeVisible) { e.preventDefault(); Q.answers.push(k.toUpperCase()); renderQuiz(); return; }
     if (k === ' ' || k === 'enter') {
       e.preventDefault();
-      if (gradeVisible) { quizNext(2); return; }
-      if (card.type === 'el' || card.type === 'art') quizAdvance(); else if (card.type !== 'ox') { Q.revealed = true; renderQuiz(); }
+      if (gradeVisible) { const def = $('#quiz [data-qg].primary'); quizNext(def ? +def.dataset.qg : 2); return; }
+      if (stepItems(card).length) quizAdvance(); else if (card.type !== 'ox') { Q.revealed = true; renderQuiz(); }
     }
   }
 
   // 테스트·자동화용 훅
   window.__hv = {
-    get state() { return S; }, idx: () => IDX, open: ci => openCrime(ci), view: setView, mode: setMode, level: setLevel,
-    expandAll: () => { setLevel(3); }, crimes: () => IDX.crimes.length, data: () => D,
+    get state() { return S; }, idx: () => IDX, open: ci => openCrime(ci), view: setView, mode: setMode, level: setLevel, single: setSingle,
+    expandAll: () => { setSingle(false); setLevel(3); }, crimes: () => IDX.crimes.length, data: () => D, displayText,
   };
 
   SHELL = document.body.innerHTML;

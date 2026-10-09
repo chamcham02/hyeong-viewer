@@ -1,5 +1,6 @@
 // e2e — 빌드된 단일 HTML을 실제 브라우저로 열어 확인한다.
 //  1) 콘솔 오류 없음  2) 모든 죄의 마인드맵(전부 펼침)에 그 죄의 원문 문단이 정확히 한 번씩, 글자 그대로 있음
+//     (변환기가 '양식상 줄바꿈'으로 표시한 Shift+Enter만 띄어쓰기로 보이는 것을 허용 — displayText 규칙)
 //  3) 원문 보기의 문단 순서가 데이터 순서와 같음  4) 가로 맵에서 카드끼리 겹치지 않음
 //  5) 휴대폰 폭에서 가로 스크롤 없음  6) 가리기·카드 채점·진도 저장·검색 이동이 동작함
 // 사용법: node tests/e2e.mjs built.html   (PLAYWRIGHT 경로는 PW_MODULE, 브라우저는 PW_CHROMIUM으로 바꿀 수 있음)
@@ -28,7 +29,7 @@ const HELPERS = () => {
     textOf(el) { const c = el.cloneNode(true); c.querySelectorAll('.deco').forEach(x => x.remove()); return c.textContent; },
     expected(ci, withFn) {
       const D = __hv.data(), crime = __hv.idx().crimes[ci].node, out = [];
-      const T = p => (p.s || []).map(s => s[0]).join('');
+      const T = p => __hv.displayText(p);
       const para = p => { out.push([p.pid, T(p)]); if (withFn) for (const s of p.s || []) if (s.length === 3) for (const q of D.fns[String(s[2])]) raw(q); };
       const raw = it => { if (it.tbl) it.tbl.cells.forEach(c => c.ps.forEach(raw)); else para(it); };
       (function walk(n) {
@@ -49,7 +50,7 @@ const HELPERS = () => {
   let checked = 0, paras = 0;
   for (let ci = 0; ci < n; ci++) {
     const r = await page.evaluate(ci => {
-      __hv.view('map'); __hv.mode('study'); __hv.open(ci); __hv.level(3);
+      __hv.view('map'); __hv.mode('study'); __hv.single(false); __hv.open(ci); __hv.level(3);
       const exp = __t.expected(ci, false).filter(([, t]) => t.trim());
       const got = new Map();
       const dup = [];
@@ -81,10 +82,20 @@ const HELPERS = () => {
     if (!r.textOK) fail(`[${r.name}] 원문 보기 글자 불일치`);
   }
   console.log(`맵·원문 확인: 죄 ${checked}개, 문단 ${paras}개`);
+  const sb = await page.evaluate(() => {
+    let n = 0, bad = 0;
+    (function walk(x) {
+      if (x.sb) for (const i of x.sb) { n++; const raw = (x.s || []).map(s => s[0]).join(''); const d = __hv.displayText(x); if (raw[i] !== '\n' || d[i] === '\n' || d.length !== raw.length) bad++; }
+      (x.c || []).forEach(walk);
+    })(__hv.data().root);
+    return { n, bad };
+  });
+  if (sb.bad) fail(`양식 줄바꿈 처리 오류 ${sb.bad}/${sb.n}`);
+  console.log(`양식 줄바꿈 → 띄어쓰기: ${sb.n}곳`);
 
   // 가리기 → 카드 눌러 공개
   const hide = await page.evaluate(() => {
-    __hv.view('map'); __hv.open(Math.min(1, __hv.crimes() - 1)); __hv.level(2); __hv.mode('hide');
+    __hv.view('map'); __hv.single(true); __hv.open(Math.min(1, __hv.crimes() - 1)); __hv.level(2); __hv.mode('hide');
     const c = document.querySelector('#mmCanvas .card.concealed');
     if (!c) return 'no concealed card';
     const id = c.dataset.id; c.click();

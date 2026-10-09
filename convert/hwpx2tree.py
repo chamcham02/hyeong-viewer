@@ -38,7 +38,6 @@ PART_RE = re.compile(r'^\s*제\s*\d+\s*편')
 CHAP_RE = re.compile(r'^\s*제\s*\d+\s*장')
 SEP_RE = re.compile(r'^[\s.·…‥]{10,}$')
 VERDICT_RE = re.compile(r'(?<![A-Za-z])[OX](?![A-Za-z])')
-DEF_RE = re.compile(r'^\s*[‘\']([^’\']{1,40})[’\']\s*(?:이|가)?란')
 
 
 # ───────────────────────── header.xml ─────────────────────────
@@ -550,6 +549,7 @@ def enrich(root, fmts, log):
 
     walk(root, None, None, None)
     link_statutes(root, stats)
+    mark_soft_breaks(root)
     return stats
 
 
@@ -559,17 +559,16 @@ def tag_node(nd, fmts, stats):
     tags = []
     nonsp = [(ch, s[1]) for s in nd['s'] for ch in s[0] if not ch.isspace()]
     blue = sum(1 for _, f in nonsp if fmts[f].get('c') in ('#0000FF', '#0432FF'))
-    if nonsp and (blue / len(nonsp) >= 0.6 or bare.startswith('(홍') or bare.startswith('홍)')
-                  or bare.startswith('채기표')):
+    if nonsp and (blue / len(nonsp) >= 0.6 or '(홍' in bare or bare.startswith('홍)') or '채기표' in bare):
         tags.append('hong')
         stats['hong'] += 1
     if '약술형' in bare:
         tags.append('yak')
         stats['yak'] += 1
-    m = DEF_RE.match(bare)
-    if m and nd['k'] == 'p':
+    term = definition_term(bare) if nd['k'] == 'p' else None
+    if term:
         tags.append('def')
-        nd['term'] = m.group(1)
+        nd['term'] = term
         stats['def'] += 1
     if '★' in bare:
         tags.append('star')
@@ -578,10 +577,25 @@ def tag_node(nd, fmts, stats):
         tags.append('pan')
     if re.search(r'통설|通說|학설|다수설|소수설|견해', bare):
         tags.append('hak')
-    if re.search(r'최근|판례변경|변경된', bare):
+    if re.search(r'최근|최신|판례변경|변경된', bare):
         tags.append('new')
     if tags:
         nd['tags'] = tags
+
+
+def definition_term(bare):
+    """정의 문장의 용어. ‘X’란 … / ‘X’이라 함은 … / ‘X’은 … 의미·말한다 / X란 …(따옴표 없이 문장 첫머리)"""
+    head = bare[:70]
+    m = re.search(r'[‘\']([^’\']{1,30})[’\']\s*(?:이)?(?:란|이라\s*함은)', head)
+    if m:
+        return m.group(1)
+    m = re.search(r'[‘\']([^’\']{1,30})[’\']\s*(?:은|는)\s', bare[:45])
+    if m and re.search(r'(의미한다|의미함|말한다|말함|뜻한다)', bare):
+        return m.group(1)
+    m = re.match(r'^([가-힣]{2,8})(?:이)?란\s', bare)
+    if m:
+        return m.group(1)
+    return None
 
 
 def quote_mask(text):
@@ -615,34 +629,43 @@ def depth_map(text):
 
 
 SEP_TOKENS = [':', ' – ', ' - ', '→', '=>', '⇒']
+NOT_A_CASE = re.compile(r'^\s*(?:\(홍\)\s*)?(?:채기표|홍\s*기재례|서술\s*구조)')
 
 
 def extract_ox(text):
+    """‘사안: 죄명 O/X’ 문장에서 O/X 카드 오프셋을 만든다.
+
+    구분자 선택: (1) 앞에 판정어가 없는 첫 구분자(사안에 X/O가 없는 보통 형식, ‘사안: 이유 → 결론’도 사안만 질문이 됨),
+    (2) 없으면 마지막 판정어 앞의 마지막 구분자(‘…날인 X → 위조 X’처럼 사안에 O/X가 들어 있는 형식).
+    """
     mask = quote_mask(text)
     depth = depth_map(text)
     verdicts = [m.start() for m in VERDICT_RE.finditer(text) if not mask[m.start()]]
-    if not verdicts:
+    v0 = [v for v in verdicts if depth[v] == 0]
+    if not v0:
         return None
-    first0 = next((v for v in verdicts if depth[v] == 0), None)
-    if first0 is None:
-        return None
-    best = None
+    last0 = v0[-1]
+    cands = []
     for tok in SEP_TOKENS:
         i = 0
         while True:
             j = text.find(tok, i)
-            if j < 0 or j >= first0:
+            if j < 0 or j >= last0:
                 break
             if depth[j] == 0 and not mask[j]:
-                if best is None or j > best[0]:
-                    best = (j, j + len(tok))
+                cands.append((j, j + len(tok)))
             i = j + 1
-    if best is not None:
+    cands.sort()
+    best = next((c for c in cands if not any(v < c[0] for v in v0)), None)
+    if best is None and cands:
+        best = cands[-1]
+    if best is not None and not NOT_A_CASE.match(text):
         q = re.sub(r'\s', '', text[:best[0]])
         if len(q) >= 3:
             a0 = best[1]
             vs = [v for v in verdicts if v >= a0]
-            return {'q': [0, best[0]], 'a': [a0, len(text)], 'v': vs}
+            if vs:
+                return {'q': [0, best[0]], 'a': [a0, len(text)], 'v': vs}
     # 명제형: 판정어만 가린다
     return {'v': [v for v in verdicts]}
 
@@ -658,10 +681,72 @@ def mnemonic(nd, fmts):
     return ''.join(chars) if len(chars) >= 2 else None
 
 
+# 줄바꿈(Shift+Enter) 중 목록·기호로 시작하는 것만 진짜 줄바꿈으로 보고, 나머지는 양식상 끊긴 줄로 본다.
+HARD_BREAK_NEXT = re.compile(
+    r'^[ \t　]*(?:[①-⑳]|ㄴ|[-–—•▸▪+*※]|⇒|=>|->|→|↔|∴|cf\.|Cf\.|CF\.|ex\.|Ex\.|\(홍|홍\)|'
+    r'\d+\s*[.)]|\(\d+\)|[IVX]+\.|[가-하]\.|결론\s*:)')
+
+
+def soft_breaks(text):
+    """양식상 들어간 줄바꿈의 위치. 뷰어는 이 위치의 줄바꿈을 띄어쓰기로 보여 준다(데이터는 원문 그대로)."""
+    out = []
+    for m in re.finditer('\n', text):
+        rest = text[m.end():]
+        if rest.strip() and HARD_BREAK_NEXT.match(rest):
+            continue
+        out.append(m.start())
+    return out
+
+
+def mark_soft_breaks(nd):
+    """트리 문단(p·el·죄 제목)과 조문 박스 문단에 sb(양식 줄바꿈 위치)를 단다. 비교표·사례 박스는 그대로 둔다."""
+    if 's' in nd and nd.get('k') in ('p', 'el', 'crime', 'chap', 'part'):
+        sb = soft_breaks(node_text(nd))
+        if sb:
+            nd['sb'] = sb
+    if nd.get('k') == 'stat':
+        for cell in nd['cells']:
+            for p in cell['ps']:
+                if 's' in p:
+                    sb = soft_breaks(''.join(x[0] for x in p['s']))
+                    if sb:
+                        p['sb'] = sb
+    for ch in nd.get('c', []):
+        mark_soft_breaks(ch)
+
+
 def norm(s):
-    s = re.sub(r'\(=?[^()]*\)', '', s)
-    s = re.split(r'\s[–-]\s', s)[0]
-    return re.sub(r'[\s·,./()\[\]‘’“”\'"~→⇒=]+', '', s)
+    prev = None
+    while prev != s:  # 중첩 괄호까지 모두 걷어 낸다
+        prev, s = s, re.sub(r'\([^()]*\)', '', s)
+    s = re.split(r'\s[–-]\s|→|⇒|=>', s)[0]
+    return re.sub(r'[\s·,./()\[\]‘’“”\'"~=!]+', '', s)
+
+
+def _bigrams(s):
+    return [s[i:i + 2] for i in range(len(s) - 1)] if len(s) >= 2 else [s]
+
+
+def link_score(cand, el):
+    """구성요건 제목(정규화)과 조문 요건(정규화)의 일치 정도. 짧은 제목은 어간 일치, 긴 제목은 2글자 조각 비율."""
+    if not cand or not el:
+        return 0.0
+    if cand == el:
+        return 1.0
+    stem_score = 0.0
+    if len(cand) <= 4:
+        stem = cand[:max(2, len(cand) - 1)]
+        if el.startswith(stem) and abs(len(el) - len(cand)) <= (2 if len(cand) <= 2 else 3):
+            stem_score = 0.9
+        if len(cand) <= 3:
+            return stem_score
+    eb = set(_bigrams(el))
+    hb = _bigrams(cand)
+    return max(stem_score, sum(1 for b in hb if b in eb) / len(hb))
+
+
+# 고의·죄수·위법성 등은 조문 요건이 아니라 쟁점 제목이다.
+ISSUE_RE = re.compile(r'고의$|죄수|가담형태|위법성|미수|친고|반의사|인과관계|예비|음모|처벌')
 
 
 def link_statutes(root, stats):
@@ -671,22 +756,28 @@ def link_statutes(root, stats):
             crime['_arts'] = []
             for ch in nd['c']:
                 if ch['k'] == 'stat':
-                    for ci, cell in enumerate(ch['cells']):
-                        for pi, p in enumerate(cell['ps']):
+                    for cell in ch['cells']:
+                        for p in cell['ps']:
                             art = p.get('art')
-                            if art and 'els' in art:
+                            if art:  # 요건(①…)이 없는 조문도 번호를 맞추기 위해 넣는다(뷰어와 같은 순서)
                                 t = ''.join(s[0] for s in p['s'])
                                 crime['_arts'].append((t[art['name'][0]:art['name'][1]],
-                                                       [norm(t[a:b]) for a, b in art['els']]))
+                                                       [norm(t[a:b]) for a, b in art.get('els', [])]))
         if nd['k'] == 'el' and crime is not None and crime.get('_arts'):
             head = ''.join(s[0] for s in nd['s'])
             cands = [norm(x) for x in re.split(r'/', head)]
-            cands = [c for c in cands if len(c) >= 2]
+            cands = [c for c in cands if len(c) >= 2 and not ISSUE_RE.search(c)]
             links = []
             for ai, (aname, els) in enumerate(crime['_arts']):
+                best = None
                 for ei, el in enumerate(els):
-                    if any(c and (c in el or (len(el) >= 3 and el in c)) for c in cands):
-                        links.append([ai, ei])
+                    sc = max((link_score(c, el) for c in cands), default=0.0)
+                    if sc >= 0.5:
+                        key = (sc, -abs(len(el) - max((len(c) for c in cands), default=0)))
+                        if best is None or key > best[0]:
+                            best = (key, ei)
+                if best is not None:
+                    links.append([ai, best[1]])
             if links:
                 nd['ln'] = links
                 stats['links'] += 1
@@ -823,6 +914,12 @@ def main(argv=None):
     title_node = next((c for c in root['c'] if c['k'] == 'title'), None)
     meta['name'] = meta.get('name') or (title_node['title'] if title_node else meta.get('title', ''))
     fns = {str(k): [raw_item(u) for u in v] for k, v in sorted(ex.fns.items())}
+    for ps in fns.values():
+        for p in ps:
+            if 's' in p:
+                sb = soft_breaks(''.join(x[0] for x in p['s']))
+                if sb:
+                    p['sb'] = sb
     data = {'v': 1, 'meta': meta, 'fmts': ex.fmts, 'fns': fns,
             'root': root}
     prune(root)
